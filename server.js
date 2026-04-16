@@ -115,16 +115,17 @@ async function scrapeList(page) {
 
     cards.forEach(card => {
       const cardText  = (card.textContent||"");
-      const cardNorm  = cardText.toLowerCase().replace(/\s+/g, " ");
+      const cardNorm  = cardText.replace(/\s+/g, " ").trim();
+      const cardLower = cardNorm.toLowerCase();
       const link = card.querySelector("a[href*='casino-complaints']");
       if (!link) return;
       const url = link.href;
 
-      // Try full timer+responder match (with normalised whitespace)
-      const timerMatch = cardNorm.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
-      if (timerMatch) {
-        const hoursLeft = parseInt(timerMatch[1]);
-        const responder = timerMatch[2].trim();
+      // Pattern 1: "X hours left for NAME to respond" (full text)
+      const fullMatch = cardLower.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
+      if (fullMatch) {
+        const hoursLeft = parseInt(fullMatch[1]);
+        const responder = fullMatch[2].trim();
         const rl = responder.toLowerCase();
         const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
         const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
@@ -136,17 +137,26 @@ async function scrapeList(page) {
         return;
       }
 
-      // Card has timer but no responder text — collect URL + debug snippet
-      if ((cardNorm.includes("hours left") || cardNorm.includes(" open")) && !r.timerUrls.includes(url)) {
+      // Pattern 2: "74 HOURS LEFT" or "74 hours left" (short format on list cards)
+      // On the casino complaints page, OPEN complaints = casino must reply
+      const shortMatch = cardLower.match(/(\d+)\s*hours?\s*left/i);
+      if (shortMatch) {
+        const hoursLeft = parseInt(shortMatch[1]);
+        const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
+        r.casinoOpenEntries.push({
+          timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
+          url,
+          hoursLeft: hoursLeft,
+          responder: "casino", // assumed — it's their complaints page
+        });
+        if (!r.timerUrls.includes(url)) r.timerUrls.push(url);
+        return;
+      }
+
+      // Pattern 3: card has OPEN status but no hours text yet
+      if (cardLower.includes(" open") && !r.timerUrls.includes(url)) {
         r.timerUrls.push(url);
-        const idx = cardNorm.indexOf("hours");
-        if (idx !== -1) {
-          r.debugCardSnippet += "[card] " +
-            cardText.substring(Math.max(0,idx-80),idx+200).replace(/\s+/g," ").trim() + " ";
-        } else {
-          // Show full card text for debugging
-          r.debugCardSnippet += "[card-open] " + cardText.substring(0,300).replace(/\s+/g," ").trim() + " ";
-        }
+        r.debugCardSnippet += "[open-no-timer] " + cardNorm.substring(0, 200) + " ";
       }
     });
 
@@ -256,23 +266,86 @@ app.get("/api/scrape", async (req, res) => {
 
         let cpHtml = null;
 
-        // ── Attempt 1: view-source navigation ─────────────────────
-        // Chrome's view-source fetches raw HTML, potentially bypassing
-        // the JavaScript redirect AskGamblers uses.
+        // ── Attempt 1: view-source + __NEXT_DATA__ parsing ────────
         try {
           const vsPage = await browser.newPage();
           await vsPage.goto("view-source:" + cpUrl, {
             waitUntil: "domcontentloaded", timeout: 20000
           });
-          cpHtml = await vsPage.evaluate(() =>
+          const vsHtml = await vsPage.evaluate(() =>
             document.documentElement ? document.documentElement.innerText : ""
           );
           await vsPage.close();
-          console.log("[full] view-source length: " + (cpHtml||"").length +
-            " | has hours: " + ((cpHtml||"").toLowerCase().indexOf("hours") !== -1));
+          console.log("[full] view-source length: " + vsHtml.length);
+
+          // Extract __NEXT_DATA__ JSON from raw source
+          const ndMatch = vsHtml.match(/<script id="__NEXT_DATA__"[^>]*>(\{.+?\})<\/script>/s) ||
+                          vsHtml.match(/__NEXT_DATA__[^=]*=\s*(\{.+?\});/s);
+          if (ndMatch) {
+            try {
+              const nd = JSON.parse(ndMatch[1]);
+              const ndStr = JSON.stringify(nd);
+              console.log("[full] __NEXT_DATA__ found, length: " + ndStr.length);
+
+              // Look for deadline/expiry timestamp and responder
+              // Try common field names AskGamblers might use
+              const deadlineMatch = ndStr.match(/"(?:deadline|expireAt|expiresAt|respondBy|dueDate|timer|endDate)"\s*:\s*"?(\d{10,}|[^"]+?T[^"]+)"?/i);
+              const responderMatch = ndStr.match(/"(?:respondent|waitingFor|nextResponder|assignedTo|currentResponder|replyFrom)"\s*:\s*"([^"]+)"/i);
+
+              if (deadlineMatch) console.log("[full] deadline field: " + deadlineMatch[0]);
+              if (responderMatch) console.log("[full] responder field: " + responderMatch[0]);
+
+              // Log first 1000 chars of relevant data for debugging
+              const pageProps = nd.props && nd.props.pageProps ? nd.props.pageProps : nd;
+              console.log("[full] pageProps keys: " + Object.keys(pageProps).join(", "));
+
+              if (deadlineMatch && responderMatch) {
+                const responder = responderMatch[1];
+                const rl = responder.toLowerCase();
+                const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
+                const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
+                const casinoMustReply = !isPlayer && !isAG;
+
+                // Calculate hours from timestamp
+                let hoursLeft = 0;
+                const rawDeadline = deadlineMatch[1];
+                if (/^\d+$/.test(rawDeadline)) {
+                  // Unix timestamp (seconds or ms)
+                  const ts = rawDeadline.length === 10
+                    ? parseInt(rawDeadline) * 1000
+                    : parseInt(rawDeadline);
+                  hoursLeft = Math.max(0, Math.floor((ts - Date.now()) / 3600000));
+                } else {
+                  hoursLeft = Math.max(0, Math.floor((new Date(rawDeadline) - Date.now()) / 3600000));
+                }
+
+                const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
+                console.log("[full] → " + hoursLeft + "h for '" + responder + "' casinoMustReply=" + casinoMustReply);
+
+                if (casinoMustReply && hoursLeft > 0) {
+                  cpHtml = "FOUND"; // mark as resolved
+                  casinoOpenEntries.push({
+                    timer: d > 0 ? (d+"d "+h+"h") : (h+"h"),
+                    url:   cpUrl, hoursLeft, responder,
+                  });
+                } else if (!casinoMustReply) {
+                  cpHtml = "FOUND_PLAYER"; // found but player's turn
+                }
+              } else {
+                // Log a chunk of __NEXT_DATA__ so we can find the right field names
+                console.log("[full] __NEXT_DATA__ sample: " + ndStr.substring(0, 800));
+              }
+            } catch(parseErr) {
+              console.log("[full] __NEXT_DATA__ parse error: " + parseErr.message);
+            }
+          } else {
+            // No __NEXT_DATA__ — log sample of view-source to find where data lives
+            const sample = vsHtml.substring(0, 500);
+            console.log("[full] no __NEXT_DATA__ found. Source sample: " + sample);
+          }
+          if (cpHtml) continue; // resolved — skip further attempts
         } catch(e) {
-          console.log("[full] view-source failed: " + e.message);
-          cpHtml = null;
+          console.log("[full] view-source error: " + e.message);
         }
 
         // ── Attempt 2: commit-based capture (before JS redirect) ───
