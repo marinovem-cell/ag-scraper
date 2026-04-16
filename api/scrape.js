@@ -1,6 +1,8 @@
 const chromium = require("@sparticuz/chromium");
 const puppeteer = require("puppeteer-core");
 
+chromium.setGraphicsMode = false;
+
 function json(res, data, status) {
   res.setHeader("Content-Type", "application/json");
   res.status(status || 200).json(data);
@@ -10,11 +12,21 @@ function err(res, message, status) {
 }
 
 async function launchBrowser() {
+  const execPath = await chromium.executablePath();
   return puppeteer.launch({
-    args: chromium.args,
+    args: [
+      ...chromium.args,
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+    ],
     defaultViewport: chromium.defaultViewport,
-    executablePath: await chromium.executablePath(),
-    headless: true,
+    executablePath: execPath,
+    headless: chromium.headless,
     ignoreHTTPSErrors: true,
   });
 }
@@ -29,7 +41,6 @@ async function openPage(browser, url) {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
-  // Wait for Cloudflare challenge to pass
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment"),
@@ -119,4 +130,3 @@ module.exports = async (req, res) => {
     }
   }
 };
-
