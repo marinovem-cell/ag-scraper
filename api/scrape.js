@@ -14,7 +14,7 @@ async function launchBrowser() {
     args: chromium.args,
     defaultViewport: chromium.defaultViewport,
     executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
+    headless: true,
     ignoreHTTPSErrors: true,
   });
 }
@@ -22,13 +22,14 @@ async function launchBrowser() {
 async function openPage(browser, url) {
   const page = await browser.newPage();
   await page.setUserAgent(
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+  // Wait for Cloudflare challenge to pass
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment"),
