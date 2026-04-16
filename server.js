@@ -76,15 +76,7 @@ async function scrapeList(page) {
       openEntries:[], totalPages:1
     };
 
-    document.querySelectorAll("*").forEach(el => {
-      if (el.children.length > 0) return;
-      const t = (el.textContent||"").trim().toUpperCase();
-      if (t==="RESOLVED")   r.resolved++;
-      if (t==="REJECTED")   r.rejected++;
-      if (t==="UNRESOLVED") r.unresolved++;
-      if (t==="OPEN")       r.open++;
-    });
-
+    // Find complaint cards first
     const selectors = ["article","[class*='complaint-item']","[class*='complaint_item']",
                        "[class*='complaint-card']","[class*='complaintCard']"];
     let cards = [];
@@ -99,11 +91,39 @@ async function scrapeList(page) {
       });
     }
 
+    // Count status ONCE per card by finding the status element
     cards.forEach(card => {
+      // Find the status badge — it's typically the first/most prominent text
+      // that exactly matches a status word
+      const statusEl = card.querySelector(
+        "[class*='status'],[class*='badge'],[class*='label'],[class*='state']"
+      );
+      let status = "";
+      if (statusEl) {
+        status = statusEl.textContent.trim().toUpperCase();
+      } else {
+        // Fallback: find leaf node with exact status text
+        const leaves = Array.from(card.querySelectorAll("*")).filter(el =>
+          el.children.length === 0
+        );
+        for (const leaf of leaves) {
+          const t = leaf.textContent.trim().toUpperCase();
+          if (t === "RESOLVED" || t === "REJECTED" || t === "UNRESOLVED" || t === "OPEN") {
+            status = t; break;
+          }
+        }
+      }
+
+      if (status === "RESOLVED")   r.resolved++;
+      if (status === "REJECTED")   r.rejected++;
+      if (status === "UNRESOLVED") r.unresolved++;
+      if (status === "OPEN")       r.open++;
+
+      // Extract timer for OPEN cards
       const link = card.querySelector("a[href*='casino-complaints']");
       if (!link) return;
-      const url      = link.href;
-      const cardLow  = (card.textContent||"").replace(/\s+/g," ").toLowerCase();
+      const url     = link.href;
+      const cardLow = (card.textContent||"").replace(/\s+/g," ").toLowerCase();
       const m = cardLow.match(/(\d+)\s*hours?\s*left/i);
       if (m) {
         const hoursLeft = parseInt(m[1]);
@@ -114,6 +134,7 @@ async function scrapeList(page) {
       }
     });
 
+    // Pagination
     document.querySelectorAll("a[href*='page=']").forEach(a => {
       const m = (a.href||"").match(/page=(\d+)/);
       if (m && parseInt(m[1]) > r.totalPages) r.totalPages = parseInt(m[1]);
