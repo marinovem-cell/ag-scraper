@@ -1,9 +1,9 @@
 {
   "name": "ag-scraper",
   "version": "1.0.0",
-  "engines": { "node": "24.x" },
+  "engines": { "node": "22.x" },
   "dependencies": {
-    "@sparticuz/chromium": "110.0.1",
-    "puppeteer-core": "19.7.5"
+    "@sparticuz/chromium": "131.0.0",
+    "puppeteer-core": "23.9.0"
   }
 }
