@@ -1,32 +1,29 @@
-const express = require("express");
+const express   = require("express");
 const puppeteer = require("puppeteer-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-puppeteer.use(StealthPlugin());
+const Stealth   = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(Stealth());
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.AG_SECRET || "";
 const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 
+// ── Browser ────────────────────────────────────────────────────────
 async function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME,
     headless: true,
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process",
+      "--no-sandbox", "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", "--disable-gpu",
+      "--no-first-run", "--no-zygote", "--single-process",
       "--window-size=1920,1080",
     ],
     ignoreHTTPSErrors: true,
   });
 }
 
-async function setupPage(browser) {
+async function openPage(browser, url) {
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
   await page.setUserAgent(
@@ -36,10 +33,6 @@ async function setupPage(browser) {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
   });
-  return page;
-}
-
-async function gotoAndWait(page, url) {
   await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
   try {
     await page.waitForFunction(
@@ -49,40 +42,19 @@ async function gotoAndWait(page, url) {
       { timeout: 30000, polling: 500 }
     );
   } catch(e) {}
-  return { title: await page.title(), finalUrl: page.url() };
+  return page;
 }
 
-async function waitForCF(page, timeout) {
-  try {
-    await page.waitForFunction(
-      () => !document.title.includes("Just a moment") &&
-            !document.title.includes("Attention Required") &&
-            document.title.length > 0,
-      { timeout: timeout || 20000, polling: 500 }
-    );
-  } catch(e) {}
-}
-
-// Scrape counts + open complaint URLs from the list page
+// ── List page scraper ──────────────────────────────────────────────
 async function scrapeList(page) {
   return page.evaluate(() => {
     const r = {
       resolved:0, rejected:0, unresolved:0, open:0,
-      timerUrls:[], totalPages:1,
-      casinoOpenEntries:[],
-      debugNextData:"", debugCardSnippet:""
+      openEntries:[], // { hoursLeft, timer, url }
+      totalPages:1
     };
 
-    // ── Try __NEXT_DATA__ (Next.js stores all page data here) ───────
-    const nextEl = document.getElementById("__NEXT_DATA__");
-    if (nextEl) {
-      try {
-        const nd = JSON.parse(nextEl.textContent);
-        r.debugNextData = JSON.stringify(nd).substring(0, 800);
-      } catch(e) {}
-    }
-
-    // ── Count statuses from DOM ──────────────────────────────────────
+    // Count statuses
     document.querySelectorAll("*").forEach(el => {
       if (el.children.length > 0) return;
       const t = (el.textContent||"").trim().toUpperCase();
@@ -92,17 +64,11 @@ async function scrapeList(page) {
       if (t==="OPEN")       r.open++;
     });
 
-    // ── Find complaint cards ─────────────────────────────────────────
-    const cardSelectors = [
-      "article",
-      "[class*='complaint-item']",
-      "[class*='complaint_item']",
-      "[class*='complaint-card']",
-      "[class*='complaintCard']",
-      ".complaint",
-    ];
+    // Find complaint cards
+    const selectors = ["article","[class*='complaint-item']","[class*='complaint_item']",
+                       "[class*='complaint-card']","[class*='complaintCard']"];
     let cards = [];
-    for (const sel of cardSelectors) {
+    for (const sel of selectors) {
       const found = Array.from(document.querySelectorAll(sel));
       if (found.length > 0) { cards = found; break; }
     }
@@ -114,52 +80,25 @@ async function scrapeList(page) {
     }
 
     cards.forEach(card => {
-      const cardText  = (card.textContent||"");
-      const cardNorm  = cardText.replace(/\s+/g, " ").trim();
-      const cardLower = cardNorm.toLowerCase();
       const link = card.querySelector("a[href*='casino-complaints']");
       if (!link) return;
-      const url = link.href;
+      const url      = link.href;
+      const cardText = (card.textContent||"").replace(/\s+/g," ").trim();
+      const cardLow  = cardText.toLowerCase();
 
-      // Pattern 1: "X hours left for NAME to respond" (full text)
-      const fullMatch = cardLower.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
-      if (fullMatch) {
-        const hoursLeft = parseInt(fullMatch[1]);
-        const responder = fullMatch[2].trim();
-        const rl = responder.toLowerCase();
-        const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
-        const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
-        if (!isPlayer && !isAG) {
-          const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-          r.casinoOpenEntries.push({ timer:d>0?(d+"d "+h+"h"):(h+"h"), url, hoursLeft, responder });
-        }
-        if (!r.timerUrls.includes(url)) r.timerUrls.push(url);
-        return;
-      }
-
-      // Pattern 2: "74 HOURS LEFT" or "74 hours left" (short format on list cards)
-      // On the casino complaints page, OPEN complaints = casino must reply
-      const shortMatch = cardLower.match(/(\d+)\s*hours?\s*left/i);
-      if (shortMatch) {
-        const hoursLeft = parseInt(shortMatch[1]);
+      // Extract hours from "74 HOURS LEFT" or "74 hours left for X to respond"
+      const hoursMatch = cardLow.match(/(\d+)\s*hours?\s*left/i);
+      if (hoursMatch) {
+        const hoursLeft = parseInt(hoursMatch[1]);
         const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-        r.casinoOpenEntries.push({
-          timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
-          url,
-          hoursLeft: hoursLeft,
-          responder: "casino", // assumed — it's their complaints page
-        });
-        if (!r.timerUrls.includes(url)) r.timerUrls.push(url);
-        return;
-      }
-
-      // Pattern 3: card has OPEN status but no hours text yet
-      if (cardLower.includes(" open") && !r.timerUrls.includes(url)) {
-        r.timerUrls.push(url);
-        r.debugCardSnippet += "[open-no-timer] " + cardNorm.substring(0, 200) + " ";
+        const timer = d > 0 ? (d+"d "+h+"h") : (h+"h");
+        if (!r.openEntries.find(e => e.url === url)) {
+          r.openEntries.push({ hoursLeft, timer, url });
+        }
       }
     });
 
+    // Pagination
     document.querySelectorAll("a[href*='page=']").forEach(a => {
       const m = (a.href||"").match(/page=(\d+)/);
       if (m && parseInt(m[1]) > r.totalPages) r.totalPages = parseInt(m[1]);
@@ -169,281 +108,82 @@ async function scrapeList(page) {
   });
 }
 
-// Scrape timer info from an individual complaint page
-async function scrapeComplaint(page) {
-  return page.evaluate(() => {
-    const body = document.body
-      ? (document.body.innerText || document.body.textContent || "")
-      : "";
-
-    // Match: "75 hours left for Alf Casino to respond."
-    const m = body.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
-    if (!m) return { hasTimer: false, casinoMustReply: false };
-
-    const hoursLeft = parseInt(m[1]);
-    const responder = m[2].trim();
-    const rl = responder.toLowerCase();
-
-    // If responder is NOT player/user/askgamblers → casino must reply
-    const isPlayer = rl.includes("player") || rl.includes("user") || rl.includes("complainant");
-    const isAG     = rl.includes("askgamblers") || rl.includes("ask gamblers");
-    const casinoMustReply = !isPlayer && !isAG;
-
-    const d = Math.floor(hoursLeft / 24);
-    const h = hoursLeft % 24;
-    const timerText = d > 0 ? (d + "d " + h + "h") : (h + "h");
-
-    return { hasTimer: true, casinoMustReply, hoursLeft, responder, timerText };
-  });
-}
-
-// ══════════════════════════════════════════
-// MAIN HANDLER
-//
-// type=full  → scrapes list page + all open complaint pages in ONE session
-//              returns complete data including casinoOpenEntries
-//
-// type=list  → scrapes list page only (counts + timerUrls)
-// type=complaint → scrapes one complaint page (must visit list page first)
-// ══════════════════════════════════════════
-
+// ── Main handler ───────────────────────────────────────────────────
 app.get("/api/scrape", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") { res.status(200).end(); return; }
 
   if (SECRET && req.query.secret !== SECRET) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+    return res.status(401).json({ ok:false, error:"Unauthorized" });
   }
 
-  const { type, url } = req.query;
-  if (!url)  return res.status(400).json({ ok: false, error: "Missing ?url=" });
-  if (!type) return res.status(400).json({ ok: false, error: "Missing ?type=" });
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ ok:false, error:"Missing ?url=" });
 
   const decodedUrl = decodeURIComponent(url);
   let browser;
 
   try {
     browser = await launchBrowser();
-    const page = await setupPage(browser);
+    const page = await openPage(browser, decodedUrl);
+    const title = await page.title();
 
-    if (type === "full") {
-      // ── Step 1: visit list page ──────────────────────────────────
-      console.log("[full] List: " + decodedUrl);
-      const listNav = await gotoAndWait(page, decodedUrl);
-      console.log("[full] Title: " + listNav.title + " | url: " + listNav.finalUrl);
+    console.log("[scrape] " + decodedUrl);
+    console.log("[scrape] title: " + title);
 
-      if (listNav.title.includes("Just a moment")) {
-        return res.status(503).json({ ok: false, error: "Cloudflare block on list page" });
-      }
-
-      const listData = await scrapeList(page);
-
-      // ── Step 2: handle pagination ────────────────────────────────
-      const allTimerUrls = [...listData.timerUrls];
-      for (let pg = 2; pg <= listData.totalPages && pg <= 20; pg++) {
-        const sep    = decodedUrl.includes("?") ? "&" : "?";
-        const pgUrl  = decodedUrl + sep + "page=" + pg;
-        await gotoAndWait(page, pgUrl);
-        const pgData = await scrapeList(page);
-        listData.resolved   += pgData.resolved;
-        listData.rejected   += pgData.rejected;
-        listData.unresolved += pgData.unresolved;
-        listData.open       += pgData.open;
-        pgData.timerUrls.forEach(u => { if (!allTimerUrls.includes(u)) allTimerUrls.push(u); });
-      }
-
-      // ── Step 3: resolve casinoOpenEntries ────────────────────────
-      let casinoOpenEntries = [...(listData.casinoOpenEntries || [])];
-      const needsVisit = allTimerUrls.filter(u =>
-        !casinoOpenEntries.find(e => e.url === u)
-      );
-
-      console.log("[full] casinoOpenEntries from list: " + casinoOpenEntries.length);
-      console.log("[full] Complaint pages to resolve: " + needsVisit.length);
-
-      for (let i = 0; i < needsVisit.length; i++) {
-        const cpUrl = needsVisit[i];
-        console.log("[full] Resolving: " + cpUrl);
-
-        let cpHtml = null;
-
-        // ── Attempt 1: view-source + __NEXT_DATA__ parsing ────────
-        try {
-          const vsPage = await browser.newPage();
-          await vsPage.goto("view-source:" + cpUrl, {
-            waitUntil: "domcontentloaded", timeout: 20000
-          });
-          const vsHtml = await vsPage.evaluate(() =>
-            document.documentElement ? document.documentElement.innerText : ""
-          );
-          await vsPage.close();
-          console.log("[full] view-source length: " + vsHtml.length);
-
-          // Extract __NEXT_DATA__ JSON from raw source
-          const ndMatch = vsHtml.match(/<script id="__NEXT_DATA__"[^>]*>(\{.+?\})<\/script>/s) ||
-                          vsHtml.match(/__NEXT_DATA__[^=]*=\s*(\{.+?\});/s);
-          if (ndMatch) {
-            try {
-              const nd = JSON.parse(ndMatch[1]);
-              const ndStr = JSON.stringify(nd);
-              console.log("[full] __NEXT_DATA__ found, length: " + ndStr.length);
-
-              // Look for deadline/expiry timestamp and responder
-              // Try common field names AskGamblers might use
-              const deadlineMatch = ndStr.match(/"(?:deadline|expireAt|expiresAt|respondBy|dueDate|timer|endDate)"\s*:\s*"?(\d{10,}|[^"]+?T[^"]+)"?/i);
-              const responderMatch = ndStr.match(/"(?:respondent|waitingFor|nextResponder|assignedTo|currentResponder|replyFrom)"\s*:\s*"([^"]+)"/i);
-
-              if (deadlineMatch) console.log("[full] deadline field: " + deadlineMatch[0]);
-              if (responderMatch) console.log("[full] responder field: " + responderMatch[0]);
-
-              // Log first 1000 chars of relevant data for debugging
-              const pageProps = nd.props && nd.props.pageProps ? nd.props.pageProps : nd;
-              console.log("[full] pageProps keys: " + Object.keys(pageProps).join(", "));
-
-              if (deadlineMatch && responderMatch) {
-                const responder = responderMatch[1];
-                const rl = responder.toLowerCase();
-                const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
-                const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
-                const casinoMustReply = !isPlayer && !isAG;
-
-                // Calculate hours from timestamp
-                let hoursLeft = 0;
-                const rawDeadline = deadlineMatch[1];
-                if (/^\d+$/.test(rawDeadline)) {
-                  // Unix timestamp (seconds or ms)
-                  const ts = rawDeadline.length === 10
-                    ? parseInt(rawDeadline) * 1000
-                    : parseInt(rawDeadline);
-                  hoursLeft = Math.max(0, Math.floor((ts - Date.now()) / 3600000));
-                } else {
-                  hoursLeft = Math.max(0, Math.floor((new Date(rawDeadline) - Date.now()) / 3600000));
-                }
-
-                const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-                console.log("[full] → " + hoursLeft + "h for '" + responder + "' casinoMustReply=" + casinoMustReply);
-
-                if (casinoMustReply && hoursLeft > 0) {
-                  cpHtml = "FOUND"; // mark as resolved
-                  casinoOpenEntries.push({
-                    timer: d > 0 ? (d+"d "+h+"h") : (h+"h"),
-                    url:   cpUrl, hoursLeft, responder,
-                  });
-                } else if (!casinoMustReply) {
-                  cpHtml = "FOUND_PLAYER"; // found but player's turn
-                }
-              } else {
-                // Log a chunk of __NEXT_DATA__ so we can find the right field names
-                console.log("[full] __NEXT_DATA__ sample: " + ndStr.substring(0, 800));
-              }
-            } catch(parseErr) {
-              console.log("[full] __NEXT_DATA__ parse error: " + parseErr.message);
-            }
-          } else {
-            // No __NEXT_DATA__ — log sample of view-source to find where data lives
-            const sample = vsHtml.substring(0, 500);
-            console.log("[full] no __NEXT_DATA__ found. Source sample: " + sample);
-          }
-          if (cpHtml) continue; // resolved — skip further attempts
-        } catch(e) {
-          console.log("[full] view-source error: " + e.message);
-        }
-
-        // ── Attempt 2: commit-based capture (before JS redirect) ───
-        if (!cpHtml || cpHtml.toLowerCase().indexOf("hours") === -1) {
-          try {
-            await page.goto(cpUrl, { waitUntil: "commit", timeout: 20000 });
-            // Capture IMMEDIATELY before any JS redirect runs
-            cpHtml = await page.content();
-            const immediateUrl = page.url();
-            console.log("[full] commit url: " + immediateUrl +
-              " | length: " + cpHtml.length +
-              " | has hours: " + (cpHtml.toLowerCase().indexOf("hours") !== -1));
-          } catch(e) {
-            console.log("[full] commit approach failed: " + e.message);
-            cpHtml = null;
-          }
-        }
-
-        if (!cpHtml) { console.log("[full] no HTML obtained"); continue; }
-
-        // ── Parse timer from HTML ──────────────────────────────────
-        const norm = cpHtml.replace(/\s+/g, " ");
-        const timerMatch = norm.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
-
-        if (!timerMatch) {
-          const idx = norm.toLowerCase().indexOf("hours");
-          if (idx !== -1) {
-            console.log("[full] hours snippet: " + norm.substring(Math.max(0,idx-60),idx+150));
-          } else {
-            console.log("[full] no 'hours' in HTML");
-          }
-          continue;
-        }
-
-        const hoursLeft = parseInt(timerMatch[1]);
-        const responder = timerMatch[2].trim();
-        const rl = responder.toLowerCase();
-        const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
-        const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
-        const casinoMustReply = !isPlayer && !isAG;
-
-        console.log("[full] → " + hoursLeft + "h for '" + responder + "' casinoMustReply=" + casinoMustReply);
-
-        if (casinoMustReply) {
-          const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-          casinoOpenEntries.push({
-            timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
-            url:       cpUrl,
-            hoursLeft: hoursLeft,
-            responder: responder,
-          });
-        }
-      }
-
-      const total = listData.resolved + listData.rejected +
-                    listData.unresolved + listData.open;
-
-      return res.json({
-        ok: true,
-        title: listNav.title,
-        resolved:   listData.resolved,
-        rejected:   listData.rejected,
-        unresolved: listData.unresolved,
-        open:       listData.open,
-        total,
-        casinoOpenEntries,
-        debugNextData:    listData.debugNextData    || "",
-        debugCardSnippet: listData.debugCardSnippet || "",
-      });
-
-    } else if (type === "list") {
-      const nav  = await gotoAndWait(page, decodedUrl);
-      if (nav.title.includes("Just a moment")) {
-        return res.status(503).json({ ok: false, error: "Cloudflare block" });
-      }
-      const data = await scrapeList(page);
-      return res.json({ ok: true, title: nav.title, finalUrl: nav.finalUrl, ...data });
-
-    } else if (type === "complaint") {
-      // Visit list page first to establish session, then navigate to complaint
-      const listBase = decodedUrl.replace(/\/casino-complaints\/.*/, "/gambling-complaints");
-      await gotoAndWait(page, "https://www.askgamblers.com/gambling-complaints");
-      const nav  = await gotoAndWait(page, decodedUrl);
-      const data = await scrapeComplaint(page);
-      return res.json({ ok: true, title: nav.title, finalUrl: nav.finalUrl, ...data });
-
-    } else {
-      return res.status(400).json({ ok: false, error: "type must be full, list, or complaint" });
+    if (title.includes("Just a moment") || title.includes("Attention Required")) {
+      return res.status(503).json({ ok:false, error:"Cloudflare block" });
     }
 
+    // Scrape page 1
+    const data       = await scrapeList(page);
+    const allEntries = [...data.openEntries];
+
+    console.log("[scrape] pg1 — R=" + data.resolved + " J=" + data.rejected +
+      " U=" + data.unresolved + " O=" + data.open + " pages=" + data.totalPages);
+
+    // Pagination
+    for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
+      const sep   = decodedUrl.includes("?") ? "&" : "?";
+      const pgUrl = decodedUrl + sep + "page=" + pg;
+      await page.goto(pgUrl, { waitUntil: "networkidle2", timeout: 45000 });
+      try {
+        await page.waitForFunction(
+          () => !document.title.includes("Just a moment") && document.title.length > 0,
+          { timeout: 15000, polling: 500 }
+        );
+      } catch(e) {}
+      const pgData = await scrapeList(page);
+      data.resolved   += pgData.resolved;
+      data.rejected   += pgData.rejected;
+      data.unresolved += pgData.unresolved;
+      data.open       += pgData.open;
+      pgData.openEntries.forEach(e => {
+        if (!allEntries.find(x => x.url === e.url)) allEntries.push(e);
+      });
+      console.log("[scrape] pg" + pg + " — O=" + pgData.open + " entries=" + pgData.openEntries.length);
+    }
+
+    const total = data.resolved + data.rejected + data.unresolved + data.open;
+
+    res.json({
+      ok:         true,
+      title,
+      resolved:   data.resolved,
+      rejected:   data.rejected,
+      unresolved: data.unresolved,
+      open:       data.open,
+      total,
+      openEntries: allEntries, // { hoursLeft, timer, url } for each OPEN complaint
+    });
+
   } catch(e) {
-    console.error("Error:", e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("[scrape] Error: " + e.message);
+    res.status(500).json({ ok:false, error:e.message });
   } finally {
     if (browser) { try { await browser.close(); } catch(e) {} }
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "AG Scraper running" }));
-
+app.get("/", (req, res) => res.json({ status:"AG Scraper running" }));
 app.listen(PORT, () => console.log("AG Scraper listening on port " + PORT));
