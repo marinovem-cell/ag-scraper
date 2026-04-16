@@ -2,7 +2,6 @@
   "version": 2,
   "functions": {
     "api/scrape.js": {
-      "memory": 1024,
       "maxDuration": 60
     }
   },
