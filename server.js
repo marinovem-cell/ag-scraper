@@ -1,4 +1,4 @@
-const express  = require("express");
+const express   = require("express");
 const puppeteer = require("puppeteer-core");
 
 const app    = express();
@@ -6,7 +6,6 @@ const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.AG_SECRET || "";
 const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 
-// ── Browser ────────────────────────────────────────────────────────
 async function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME,
@@ -19,6 +18,7 @@ async function launchBrowser() {
       "--no-first-run",
       "--no-zygote",
       "--single-process",
+      "--disable-blink-features=AutomationControlled",
     ],
     ignoreHTTPSErrors: true,
   });
@@ -26,24 +26,46 @@ async function launchBrowser() {
 
 async function openPage(browser, url) {
   const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-  );
-  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+
+  // Mask automation
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    window.chrome = { runtime: {} };
   });
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+  });
+
+  // Navigate and wait for network to settle
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+
+  // Wait up to 30s for Cloudflare to pass
   try {
     await page.waitForFunction(
-      () => !document.title.includes("Just a moment"),
-      { timeout: 12000 }
+      () => !document.title.includes("Just a moment") &&
+            !document.title.includes("Attention Required") &&
+            document.title.length > 0,
+      { timeout: 30000, polling: 500 }
     );
-  } catch(e) {}
+  } catch(e) {
+    // Log what title we got
+    const title = await page.title();
+    console.log("Timeout waiting for CF — title: " + title);
+  }
+
   return page;
 }
 
-// ── Scrapers ───────────────────────────────────────────────────────
 async function scrapeListPage(page) {
   return page.evaluate(() => {
     const r = { resolved:0, rejected:0, unresolved:0, open:0, timerUrls:[], totalPages:1 };
@@ -90,7 +112,6 @@ async function scrapeComplaintPage(page) {
   });
 }
 
-// ── Route ──────────────────────────────────────────────────────────
 app.get("/api/scrape", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
@@ -110,17 +131,22 @@ app.get("/api/scrape", async (req, res) => {
     browser = await launchBrowser();
     const page  = await openPage(browser, decodeURIComponent(url));
     const title = await page.title();
+    const html  = await page.content();
+
+    console.log("Page title: " + title);
+    console.log("HTML length: " + html.length);
 
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
-      return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved" });
+      return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved", title });
     }
 
     const data = type === "list"
       ? await scrapeListPage(page)
       : await scrapeComplaintPage(page);
 
-    res.json({ ok: true, title, ...data });
+    res.json({ ok: true, title, htmlLength: html.length, ...data });
   } catch(e) {
+    console.error("Error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
   } finally {
     if (browser) { try { await browser.close(); } catch(e) {} }
