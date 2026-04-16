@@ -57,6 +57,17 @@ async function gotoAndWait(page, url) {
   return { title: await page.title(), finalUrl: page.url() };
 }
 
+async function waitForCF(page, timeout) {
+  try {
+    await page.waitForFunction(
+      () => !document.title.includes("Just a moment") &&
+            !document.title.includes("Attention Required") &&
+            document.title.length > 0,
+      { timeout: timeout || 20000, polling: 500 }
+    );
+  } catch(e) {}
+}
+
 // Scrape counts + open complaint URLs from the list page
 async function scrapeList(page) {
   return page.evaluate(() => {
@@ -130,6 +141,12 @@ async function scrapeList(page) {
       const tl = cardText.toLowerCase();
       if ((tl.includes("hours left") || tl.includes(" open")) && !r.timerUrls.includes(url)) {
         r.timerUrls.push(url);
+        // Debug: show what text is near "hours" so we can adjust the regex
+        const idx = tl.indexOf("hours");
+        if (idx !== -1) {
+          r.debugCardSnippet = (r.debugCardSnippet || "") +
+            "[card]" + cardText.substring(Math.max(0, idx-80), idx+120).replace(/\s+/g," ").trim() + " ";
+        }
       }
     });
 
