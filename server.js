@@ -6,6 +6,8 @@ const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.AG_SECRET || "";
 const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 
+const AG_BASE = "https://www.askgamblers.com";
+
 async function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME,
@@ -25,18 +27,15 @@ async function launchBrowser() {
   });
 }
 
-async function openPage(browser, url) {
+async function setupPage(browser) {
   const page = await browser.newPage();
-
   await page.setViewport({ width: 1920, height: 1080 });
-
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
     window.chrome = { runtime: {} };
   });
-
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
@@ -44,20 +43,24 @@ async function openPage(browser, url) {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
   });
+  return page;
+}
 
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
-
-  // Wait for CF to pass
+async function waitForCF(page, timeout) {
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment") &&
             !document.title.includes("Attention Required") &&
             document.title.length > 0,
-      { timeout: 30000, polling: 500 }
+      { timeout: timeout || 30000, polling: 500 }
     );
   } catch(e) {}
+}
 
-  return page;
+async function navigateTo(page, url) {
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+  await waitForCF(page, 30000);
+  return { title: await page.title(), finalUrl: page.url() };
 }
 
 async function scrapeListPage(page) {
@@ -92,20 +95,15 @@ async function scrapeComplaintPage(page) {
     const r = {
       hasTimer: false, casinoMustReply: false,
       hoursLeft: null, responder: null, timerText: null,
-      // Debug: include raw text snippet around "hours"
       debugSnippet: ""
     };
     const body = document.body
       ? (document.body.innerText || document.body.textContent || "")
       : "";
-
-    // Grab snippet around "hours" for debugging
     const idx = body.toLowerCase().indexOf("hours");
-    if (idx !== -1) r.debugSnippet = body.substring(Math.max(0, idx-60), idx+100);
-
+    if (idx !== -1) r.debugSnippet = body.substring(Math.max(0, idx-60), idx+120);
     const m = body.match(/(\d+)\s*hours?\s*left\s*for\s*([^\.]+?)\s*to\s*respond/i);
     if (!m) return r;
-
     r.hasTimer  = true;
     r.hoursLeft = parseInt(m[1]);
     r.responder = m[2].trim();
@@ -136,25 +134,39 @@ app.get("/api/scrape", async (req, res) => {
   let browser;
   try {
     browser = await launchBrowser();
-    const page    = await openPage(browser, decodeURIComponent(url));
-    const title   = await page.title();
-    const finalUrl = page.url(); // actual URL after redirects
-    const html    = await page.content();
+    const page = await setupPage(browser);
+    const decodedUrl = decodeURIComponent(url);
 
-    console.log("Requested: " + decodeURIComponent(url));
-    console.log("Final URL: " + finalUrl);
-    console.log("Title: " + title);
-    console.log("HTML: " + html.length + " chars");
+    if (type === "list") {
+      // Direct navigation for list page
+      const nav = await navigateTo(page, decodedUrl);
+      console.log("List page — title: " + nav.title + " | url: " + nav.finalUrl);
 
-    if (title.includes("Just a moment") || title.includes("Attention Required")) {
-      return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved", title });
+      if (nav.title.includes("Just a moment") || nav.title.includes("Attention Required")) {
+        return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved" });
+      }
+
+      const data = await scrapeListPage(page);
+      return res.json({ ok: true, title: nav.title, finalUrl: nav.finalUrl, ...data });
+
+    } else {
+      // For complaint pages: visit homepage first to establish session,
+      // then navigate to the specific complaint
+      console.log("Complaint — establishing session via homepage...");
+      await navigateTo(page, AG_BASE + "/gambling-complaints");
+
+      console.log("Complaint — navigating to: " + decodedUrl);
+      const nav = await navigateTo(page, decodedUrl);
+      console.log("Complaint — title: " + nav.title + " | finalUrl: " + nav.finalUrl);
+
+      if (nav.title.includes("Just a moment") || nav.title.includes("Attention Required")) {
+        return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved" });
+      }
+
+      const data = await scrapeComplaintPage(page);
+      return res.json({ ok: true, title: nav.title, finalUrl: nav.finalUrl, ...data });
     }
 
-    const data = type === "list"
-      ? await scrapeListPage(page)
-      : await scrapeComplaintPage(page);
-
-    res.json({ ok: true, title, finalUrl, htmlLength: html.length, ...data });
   } catch(e) {
     console.error("Error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
