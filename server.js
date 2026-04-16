@@ -62,8 +62,10 @@ async function scrapeList(page) {
   return page.evaluate(() => {
     const r = {
       resolved:0, rejected:0, unresolved:0, open:0,
-      timerUrls:[], totalPages:1
+      timerUrls:[], totalPages:1,
+      casinoOpenEntries:[] // populated when timer text found directly in card
     };
+
     document.querySelectorAll("*").forEach(el => {
       if (el.children.length > 0) return;
       const t = (el.textContent||"").trim().toUpperCase();
@@ -72,20 +74,70 @@ async function scrapeList(page) {
       if (t==="UNRESOLVED") r.unresolved++;
       if (t==="OPEN")       r.open++;
     });
-    // Collect URLs of cards that have a timer (OPEN cards)
-    document.querySelectorAll("a[href*='casino-complaints']").forEach(a => {
-      const card = a.closest("article,li,[class*='card'],[class*='complaint']");
-      if (!card) return;
-      const t = (card.textContent||"").toLowerCase();
-      if ((t.includes("hours left") || t.includes(" open")) &&
-          !r.timerUrls.includes(a.href)) {
-        r.timerUrls.push(a.href);
+
+    // Find complaint cards — try multiple selectors
+    const cardSelectors = [
+      "article",
+      "[class*='complaint-item']",
+      "[class*='complaint_item']",
+      "[class*='complaint-card']",
+      "[class*='complaintCard']",
+      ".complaint",
+    ];
+
+    let cards = [];
+    for (const sel of cardSelectors) {
+      const found = Array.from(document.querySelectorAll(sel));
+      if (found.length > 0) { cards = found; break; }
+    }
+
+    // Fallback: find all casino-complaints links and use parent containers
+    if (cards.length === 0) {
+      document.querySelectorAll("a[href*='casino-complaints']").forEach(a => {
+        const card = a.closest("article,li,div[class],[class*='card']");
+        if (card && !cards.includes(card)) cards.push(card);
+      });
+    }
+
+    cards.forEach(card => {
+      const cardText = card.textContent || "";
+      const link = card.querySelector("a[href*='casino-complaints']");
+      if (!link) return;
+      const url = link.href;
+
+      // Try to extract "X hours left for NAME to respond" directly from card
+      const timerMatch = cardText.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
+      if (timerMatch) {
+        const hoursLeft = parseInt(timerMatch[1]);
+        const responder = timerMatch[2].trim();
+        const rl = responder.toLowerCase();
+        const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
+        const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
+        if (!isPlayer && !isAG) {
+          const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
+          r.casinoOpenEntries.push({
+            timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
+            url:       url,
+            hoursLeft: hoursLeft,
+            responder: responder,
+          });
+        }
+        if (!r.timerUrls.includes(url)) r.timerUrls.push(url);
+        return;
+      }
+
+      // Fallback: card has "hours left" or "open" but no responder text
+      const tl = cardText.toLowerCase();
+      if ((tl.includes("hours left") || tl.includes(" open")) && !r.timerUrls.includes(url)) {
+        r.timerUrls.push(url);
       }
     });
+
     document.querySelectorAll("a[href*='page=']").forEach(a => {
       const m = (a.href||"").match(/page=(\d+)/);
       if (m && parseInt(m[1]) > r.totalPages) r.totalPages = parseInt(m[1]);
     });
+
     return r;
   });
 }
@@ -173,34 +225,68 @@ app.get("/api/scrape", async (req, res) => {
       }
 
       // ── Step 3: visit each open complaint in same session ────────
-      const casinoOpenEntries = []; // { timer, url } where casino must reply
+      const casinoOpenEntries = [];
 
       for (let i = 0; i < allTimerUrls.length; i++) {
         const cpUrl = allTimerUrls[i];
         console.log("[full] Complaint " + (i+1) + "/" + allTimerUrls.length + ": " + cpUrl);
-        const cpNav = await gotoAndWait(page, cpUrl);
-        console.log("[full] → title: " + cpNav.title + " finalUrl: " + cpNav.finalUrl);
 
-        // If still being redirected, skip
-        if (cpNav.finalUrl === "https://www.askgamblers.com/casino-complaints" ||
-            cpNav.finalUrl === "https://www.askgamblers.com/gambling-complaints") {
-          console.log("[full] ← redirected, skipping");
-          continue;
+        try {
+          // Try clicking the link on the page rather than direct navigation
+          // This looks like a real user clicking, not a bot navigating directly
+          const linkFound = await page.evaluate((href) => {
+            const a = document.querySelector('a[href="' + href + '"]') ||
+                      document.querySelector('a[href*="' + href.split('/').pop() + '"]');
+            if (a) { a.click(); return true; }
+            return false;
+          }, cpUrl);
+
+          if (linkFound) {
+            // Wait for navigation after click
+            await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 })
+              .catch(() => {});
+            await waitForCF(page, 20000);
+          } else {
+            // Fallback to direct navigation if link not found on page
+            console.log("[full] Link not found on page, using goto");
+            await page.setExtraHTTPHeaders({
+              "Referer": decodedUrl,
+              "Accept-Language": "en-US,en;q=0.9",
+            });
+            await gotoAndWait(page, cpUrl);
+          }
+
+          const cpNav = { title: await page.title(), finalUrl: page.url() };
+          console.log("[full] → title: " + cpNav.title + " finalUrl: " + cpNav.finalUrl);
+
+          // If still being redirected, skip
+          if (cpNav.finalUrl === "https://www.askgamblers.com/casino-complaints" ||
+              cpNav.finalUrl === "https://www.askgamblers.com/gambling-complaints") {
+            console.log("[full] ← redirected, skipping");
+            continue;
+          }
+
+          const cpData = await scrapeComplaint(page);
+          console.log("[full] → hasTimer=" + cpData.hasTimer +
+            " casinoMustReply=" + cpData.casinoMustReply +
+            " responder=" + cpData.responder);
+
+          if (cpData.hasTimer && cpData.casinoMustReply) {
+            casinoOpenEntries.push({
+              timer: cpData.timerText,
+              url:   cpUrl,
+              hoursLeft: cpData.hoursLeft,
+              responder: cpData.responder,
+            });
+          }
+
+        } catch(cpErr) {
+          console.log("[full] Complaint error: " + cpErr.message);
         }
 
-        const cpData = await scrapeComplaint(page);
-        console.log("[full] → hasTimer=" + cpData.hasTimer +
-          " casinoMustReply=" + cpData.casinoMustReply +
-          " responder=" + cpData.responder);
-
-        if (cpData.hasTimer && cpData.casinoMustReply) {
-          casinoOpenEntries.push({
-            timer: cpData.timerText,
-            url:   cpUrl,
-            hoursLeft: cpData.hoursLeft,
-            responder: cpData.responder,
-          });
-        }
+        // Navigate back to list page after each complaint
+        // so the next click can find its link
+        await gotoAndWait(page, decodedUrl);
       }
 
       const total = listData.resolved + listData.rejected +
