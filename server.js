@@ -1,5 +1,7 @@
-const express   = require("express");
-const puppeteer = require("puppeteer-core");
+const express = require("express");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
@@ -18,7 +20,6 @@ async function launchBrowser() {
       "--no-first-run",
       "--no-zygote",
       "--single-process",
-      "--disable-blink-features=AutomationControlled",
       "--window-size=1920,1080",
     ],
     ignoreHTTPSErrors: true,
@@ -28,12 +29,6 @@ async function launchBrowser() {
 async function setupPage(browser) {
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    window.chrome = { runtime: {} };
-  });
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
