@@ -242,9 +242,10 @@ app.get("/api/scrape", async (req, res) => {
       }
 
       // ── Step 3: resolve casinoOpenEntries ────────────────────────
-      // If the list page cards already contained "X hours left for NAME to respond"
-      // text, we already have the data we need without visiting individual pages.
-      // Only attempt individual page visits for cards where responder wasn't found.
+      // AskGamblers blocks direct navigation to individual complaint pages.
+      // Solution: fetch the complaint page HTML from WITHIN the browser's
+      // JS context using fetch() — this uses the established session cookies
+      // and looks like an internal XHR request, not a bot navigation.
 
       let casinoOpenEntries = [...(listData.casinoOpenEntries || [])];
       const needsVisit = allTimerUrls.filter(u =>
@@ -252,49 +253,72 @@ app.get("/api/scrape", async (req, res) => {
       );
 
       console.log("[full] casinoOpenEntries from list: " + casinoOpenEntries.length);
-      console.log("[full] timerUrls needing individual visit: " + needsVisit.length);
+      console.log("[full] Fetching " + needsVisit.length + " complaint pages via in-page fetch");
 
       for (let i = 0; i < needsVisit.length; i++) {
         const cpUrl = needsVisit[i];
-        console.log("[full] Visiting: " + cpUrl);
+        console.log("[full] Fetching: " + cpUrl);
 
         try {
-          // Navigate back to list then click the link
-          await gotoAndWait(page, decodedUrl);
-          const clicked = await page.evaluate((targetUrl) => {
-            const links = Array.from(document.querySelectorAll("a[href*='casino-complaints']"));
-            const link  = links.find(a => a.href === targetUrl);
-            if (link) { link.click(); return true; }
-            return false;
+          // Fetch HTML from within the page context — uses existing session
+          const cpHtml = await page.evaluate(async (url) => {
+            try {
+              const res = await fetch(url, {
+                method: "GET",
+                credentials: "include",
+                headers: {
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "en-US,en;q=0.9",
+                }
+              });
+              if (!res.ok) return null;
+              return await res.text();
+            } catch(e) {
+              return null;
+            }
           }, cpUrl);
 
-          if (clicked) {
-            await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(()=>{});
-            await waitForCF(page, 15000);
-          } else {
-            await page.setExtraHTTPHeaders({ "Referer": decodedUrl, "Accept-Language": "en-US,en;q=0.9" });
-            await gotoAndWait(page, cpUrl);
+          if (!cpHtml) {
+            console.log("[full] fetch returned null for: " + cpUrl);
+            continue;
           }
 
-          const cpFinalUrl = page.url();
-          console.log("[full] → finalUrl: " + cpFinalUrl);
+          console.log("[full] HTML length: " + cpHtml.length);
 
-          if (cpFinalUrl === "https://www.askgamblers.com/casino-complaints" ||
-              cpFinalUrl === "https://www.askgamblers.com/gambling-complaints") {
-            console.log("[full] ← redirected, skipping"); continue;
+          // Parse timer text from the fetched HTML
+          const timerMatch = cpHtml.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
+          if (!timerMatch) {
+            // Show snippet for debugging
+            const idx = cpHtml.toLowerCase().indexOf("hours");
+            if (idx !== -1) {
+              console.log("[full] hours snippet: " + cpHtml.substring(Math.max(0,idx-60), idx+100).replace(/\s+/g," ").trim());
+            } else {
+              console.log("[full] no 'hours' found in fetched HTML");
+            }
+            continue;
           }
 
-          const cpData = await scrapeComplaint(page);
-          console.log("[full] → hasTimer=" + cpData.hasTimer + " responder=" + cpData.responder);
+          const hoursLeft = parseInt(timerMatch[1]);
+          const responder = timerMatch[2].trim();
+          const rl = responder.toLowerCase();
+          const isPlayer = rl.includes("player")||rl.includes("user")||rl.includes("complainant");
+          const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
+          const casinoMustReply = !isPlayer && !isAG;
 
-          if (cpData.hasTimer && cpData.casinoMustReply) {
+          console.log("[full] → " + hoursLeft + "h left for '" + responder + "' casinoMustReply=" + casinoMustReply);
+
+          if (casinoMustReply) {
+            const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
             casinoOpenEntries.push({
-              timer: cpData.timerText, url: cpFinalUrl,
-              hoursLeft: cpData.hoursLeft, responder: cpData.responder,
+              timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
+              url:       cpUrl,
+              hoursLeft: hoursLeft,
+              responder: responder,
             });
           }
+
         } catch(cpErr) {
-          console.log("[full] Complaint error: " + cpErr.message);
+          console.log("[full] fetch error: " + cpErr.message);
         }
       }
 
