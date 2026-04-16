@@ -19,6 +19,7 @@ async function launchBrowser() {
       "--no-zygote",
       "--single-process",
       "--disable-blink-features=AutomationControlled",
+      "--window-size=1920,1080",
     ],
     ignoreHTTPSErrors: true,
   });
@@ -27,7 +28,8 @@ async function launchBrowser() {
 async function openPage(browser, url) {
   const page = await browser.newPage();
 
-  // Mask automation
+  await page.setViewport({ width: 1920, height: 1080 });
+
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
@@ -41,15 +43,11 @@ async function openPage(browser, url) {
   await page.setExtraHTTPHeaders({
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
   });
 
-  // Navigate and wait for network to settle
   await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
 
-  // Wait up to 30s for Cloudflare to pass
+  // Wait for CF to pass
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment") &&
@@ -57,11 +55,7 @@ async function openPage(browser, url) {
             document.title.length > 0,
       { timeout: 30000, polling: 500 }
     );
-  } catch(e) {
-    // Log what title we got
-    const title = await page.title();
-    console.log("Timeout waiting for CF — title: " + title);
-  }
+  } catch(e) {}
 
   return page;
 }
@@ -95,10 +89,23 @@ async function scrapeListPage(page) {
 
 async function scrapeComplaintPage(page) {
   return page.evaluate(() => {
-    const r = { hasTimer:false, casinoMustReply:false, hoursLeft:null, responder:null, timerText:null };
-    const body = document.body ? (document.body.innerText||document.body.textContent||"") : "";
+    const r = {
+      hasTimer: false, casinoMustReply: false,
+      hoursLeft: null, responder: null, timerText: null,
+      // Debug: include raw text snippet around "hours"
+      debugSnippet: ""
+    };
+    const body = document.body
+      ? (document.body.innerText || document.body.textContent || "")
+      : "";
+
+    // Grab snippet around "hours" for debugging
+    const idx = body.toLowerCase().indexOf("hours");
+    if (idx !== -1) r.debugSnippet = body.substring(Math.max(0, idx-60), idx+100);
+
     const m = body.match(/(\d+)\s*hours?\s*left\s*for\s*([^\.]+?)\s*to\s*respond/i);
     if (!m) return r;
+
     r.hasTimer  = true;
     r.hoursLeft = parseInt(m[1]);
     r.responder = m[2].trim();
@@ -129,12 +136,15 @@ app.get("/api/scrape", async (req, res) => {
   let browser;
   try {
     browser = await launchBrowser();
-    const page  = await openPage(browser, decodeURIComponent(url));
-    const title = await page.title();
-    const html  = await page.content();
+    const page    = await openPage(browser, decodeURIComponent(url));
+    const title   = await page.title();
+    const finalUrl = page.url(); // actual URL after redirects
+    const html    = await page.content();
 
-    console.log("Page title: " + title);
-    console.log("HTML length: " + html.length);
+    console.log("Requested: " + decodeURIComponent(url));
+    console.log("Final URL: " + finalUrl);
+    console.log("Title: " + title);
+    console.log("HTML: " + html.length + " chars");
 
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return res.status(503).json({ ok: false, error: "Cloudflare challenge not solved", title });
@@ -144,7 +154,7 @@ app.get("/api/scrape", async (req, res) => {
       ? await scrapeListPage(page)
       : await scrapeComplaintPage(page);
 
-    res.json({ ok: true, title, htmlLength: html.length, ...data });
+    res.json({ ok: true, title, finalUrl, htmlLength: html.length, ...data });
   } catch(e) {
     console.error("Error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
