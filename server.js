@@ -74,9 +74,20 @@ async function scrapeList(page) {
     const r = {
       resolved:0, rejected:0, unresolved:0, open:0,
       timerUrls:[], totalPages:1,
-      casinoOpenEntries:[] // populated when timer text found directly in card
+      casinoOpenEntries:[],
+      debugNextData:"", debugCardSnippet:""
     };
 
+    // ── Try __NEXT_DATA__ (Next.js stores all page data here) ───────
+    const nextEl = document.getElementById("__NEXT_DATA__");
+    if (nextEl) {
+      try {
+        const nd = JSON.parse(nextEl.textContent);
+        r.debugNextData = JSON.stringify(nd).substring(0, 800);
+      } catch(e) {}
+    }
+
+    // ── Count statuses from DOM ──────────────────────────────────────
     document.querySelectorAll("*").forEach(el => {
       if (el.children.length > 0) return;
       const t = (el.textContent||"").trim().toUpperCase();
@@ -86,7 +97,7 @@ async function scrapeList(page) {
       if (t==="OPEN")       r.open++;
     });
 
-    // Find complaint cards — try multiple selectors
+    // ── Find complaint cards ─────────────────────────────────────────
     const cardSelectors = [
       "article",
       "[class*='complaint-item']",
@@ -95,14 +106,11 @@ async function scrapeList(page) {
       "[class*='complaintCard']",
       ".complaint",
     ];
-
     let cards = [];
     for (const sel of cardSelectors) {
       const found = Array.from(document.querySelectorAll(sel));
       if (found.length > 0) { cards = found; break; }
     }
-
-    // Fallback: find all casino-complaints links and use parent containers
     if (cards.length === 0) {
       document.querySelectorAll("a[href*='casino-complaints']").forEach(a => {
         const card = a.closest("article,li,div[class],[class*='card']");
@@ -111,13 +119,14 @@ async function scrapeList(page) {
     }
 
     cards.forEach(card => {
-      const cardText = card.textContent || "";
+      const cardText  = (card.textContent||"");
+      const cardNorm  = cardText.toLowerCase().replace(/\s+/g, " ");
       const link = card.querySelector("a[href*='casino-complaints']");
       if (!link) return;
       const url = link.href;
 
-      // Try to extract "X hours left for NAME to respond" directly from card
-      const timerMatch = cardText.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
+      // Try full timer+responder match (with normalised whitespace)
+      const timerMatch = cardNorm.match(/(\d+)\s*hours?\s*left\s*for\s*(.+?)\s*to\s*respond/i);
       if (timerMatch) {
         const hoursLeft = parseInt(timerMatch[1]);
         const responder = timerMatch[2].trim();
@@ -126,26 +135,22 @@ async function scrapeList(page) {
         const isAG     = rl.includes("askgamblers")||rl.includes("ask gamblers");
         if (!isPlayer && !isAG) {
           const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-          r.casinoOpenEntries.push({
-            timer:     d > 0 ? (d+"d "+h+"h") : (h+"h"),
-            url:       url,
-            hoursLeft: hoursLeft,
-            responder: responder,
-          });
+          r.casinoOpenEntries.push({ timer:d>0?(d+"d "+h+"h"):(h+"h"), url, hoursLeft, responder });
         }
         if (!r.timerUrls.includes(url)) r.timerUrls.push(url);
         return;
       }
 
-      // Fallback: card has "hours left" or "open" but no responder text
-      const tl = cardText.toLowerCase();
-      if ((tl.includes("hours left") || tl.includes(" open")) && !r.timerUrls.includes(url)) {
+      // Card has timer but no responder text — collect URL + debug snippet
+      if ((cardNorm.includes("hours left") || cardNorm.includes(" open")) && !r.timerUrls.includes(url)) {
         r.timerUrls.push(url);
-        // Debug: show what text is near "hours" so we can adjust the regex
-        const idx = tl.indexOf("hours");
+        const idx = cardNorm.indexOf("hours");
         if (idx !== -1) {
-          r.debugCardSnippet = (r.debugCardSnippet || "") +
-            "[card]" + cardText.substring(Math.max(0, idx-80), idx+120).replace(/\s+/g," ").trim() + " ";
+          r.debugCardSnippet += "[card] " +
+            cardText.substring(Math.max(0,idx-80),idx+200).replace(/\s+/g," ").trim() + " ";
+        } else {
+          // Show full card text for debugging
+          r.debugCardSnippet += "[card-open] " + cardText.substring(0,300).replace(/\s+/g," ").trim() + " ";
         }
       }
     });
@@ -333,7 +338,9 @@ app.get("/api/scrape", async (req, res) => {
         unresolved: listData.unresolved,
         open:       listData.open,
         total,
-        casinoOpenEntries, // entries where casino must reply — for the sheet
+        casinoOpenEntries,
+        debugNextData:    listData.debugNextData    || "",
+        debugCardSnippet: listData.debugCardSnippet || "",
       });
 
     } else if (type === "list") {
