@@ -62,9 +62,9 @@ async function openPage(browser, url) {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   });
 
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
 
-  // Wait for Cloudflare to clear
+  // Wait for Cloudflare to clear (up to 20s)
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment") &&
@@ -187,11 +187,11 @@ async function scrapeCasino(url) {
     for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
       const sep   = url.includes("?") ? "&" : "?";
       const pgUrl = url + sep + "page=" + pg;
-      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
       try {
         await page.waitForFunction(
           () => !document.title.includes("Just a moment") && document.title.length > 0,
-          { timeout: 15000, polling: 500 }
+          { timeout: 12000, polling: 500 }
         );
       } catch(e) {}
       const pgData = await scrapeList(page);
