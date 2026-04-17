@@ -56,15 +56,30 @@ async function openPage(browser, url) {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
   });
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
+
+  // Use domcontentloaded — faster than networkidle2, avoids chat/popup timeouts
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+  // Wait for Cloudflare to clear
   try {
     await page.waitForFunction(
       () => !document.title.includes("Just a moment") &&
             !document.title.includes("Attention Required") &&
             document.title.length > 0,
-      { timeout: 30000, polling: 500 }
+      { timeout: 20000, polling: 500 }
     );
   } catch(e) {}
+
+  // Wait for complaint cards to appear (up to 10s)
+  try {
+    await page.waitForFunction(
+      () => document.querySelector(
+        "article, [class*='complaint-item'], [class*='complaint-card'], a[href*='casino-complaints']"
+      ) !== null,
+      { timeout: 10000, polling: 500 }
+    );
+  } catch(e) {} // OK if no cards (casino with 0 complaints)
+
   return page;
 }
 
@@ -160,15 +175,21 @@ async function scrapeCasino(url) {
     const data       = await scrapeList(page);
     const allEntries = [...data.openEntries];
 
-    // Pagination — navigate within same page (faster than new page)
+    // Pagination — navigate within same page
     for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
       const sep   = url.includes("?") ? "&" : "?";
       const pgUrl = url + sep + "page=" + pg;
-      await page.goto(pgUrl, { waitUntil: "networkidle2", timeout: 45000 });
+      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       try {
         await page.waitForFunction(
           () => !document.title.includes("Just a moment") && document.title.length > 0,
           { timeout: 15000, polling: 500 }
+        );
+      } catch(e) {}
+      try {
+        await page.waitForFunction(
+          () => document.querySelector("article,[class*='complaint-item'],a[href*='casino-complaints']") !== null,
+          { timeout: 8000, polling: 500 }
         );
       } catch(e) {}
       const pgData = await scrapeList(page);
