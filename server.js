@@ -8,56 +8,60 @@ const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.AG_SECRET || "";
 const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 
-// ── Shared browser instance (reused across requests) ──────────────
-let sharedBrowser = null;
-let browserLastUsed = 0;
-const BROWSER_TTL = 5 * 60 * 1000; // recycle after 5 min idle
-
-async function getBrowser() {
-  const now = Date.now();
-  // Recycle if idle too long or crashed
-  if (sharedBrowser) {
-    try {
-      await sharedBrowser.version(); // ping
-      if (now - browserLastUsed > BROWSER_TTL) {
-        await sharedBrowser.close().catch(()=>{});
-        sharedBrowser = null;
-      }
-    } catch(e) {
-      sharedBrowser = null;
-    }
-  }
-  if (!sharedBrowser) {
-    console.log("[browser] Launching new instance");
-    sharedBrowser = await puppeteer.launch({
-      executablePath: CHROME,
-      headless: true,
-      args: [
-        "--no-sandbox", "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage", "--disable-gpu",
-        "--no-first-run", "--no-zygote", "--single-process",
-        "--window-size=1920,1080",
-      ],
-      ignoreHTTPSErrors: true,
-    });
-  }
-  browserLastUsed = now;
-  return sharedBrowser;
+// ── Browser — fresh launch per request, no shared state ───────────
+// Shared browser caused OOM on Render's free 512MB tier after ~8 pages.
+// Fresh launch adds ~15s but is 100% reliable.
+async function launchBrowser() {
+  return puppeteer.launch({
+    executablePath: CHROME,
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+      "--window-size=1280,800",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--safebrowsing-disable-auto-update",
+    ],
+    ignoreHTTPSErrors: true,
+  });
 }
 
-// ── Page helpers ───────────────────────────────────────────────────
+// ── Page setup ─────────────────────────────────────────────────────
 async function openPage(browser, url) {
   const page = await browser.newPage();
-  await page.setViewport({ width: 1920, height: 1080 });
+
+  // Block unnecessary resources to save memory & speed up loading
+  await page.setRequestInterception(true);
+  page.on("request", req => {
+    const type = req.resourceType();
+    if (["image","stylesheet","font","media","websocket"].includes(type)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
+  await page.setViewport({ width: 1280, height: 800 });
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
   );
   await page.setExtraHTTPHeaders({
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   });
 
-  // Use domcontentloaded — faster than networkidle2, avoids chat/popup timeouts
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
   // Wait for Cloudflare to clear
@@ -70,15 +74,15 @@ async function openPage(browser, url) {
     );
   } catch(e) {}
 
-  // Wait for complaint cards to appear (up to 10s)
+  // Wait for complaint cards
   try {
     await page.waitForFunction(
       () => document.querySelector(
-        "article, [class*='complaint-item'], [class*='complaint-card'], a[href*='casino-complaints']"
+        "article,[class*='complaint-item'],[class*='complaint-card'],a[href*='casino-complaints']"
       ) !== null,
       { timeout: 10000, polling: 500 }
     );
-  } catch(e) {} // OK if no cards (casino with 0 complaints)
+  } catch(e) {}
 
   return page;
 }
@@ -91,9 +95,14 @@ async function scrapeList(page) {
       openEntries:[], totalPages:1
     };
 
-    // Find complaint cards first
-    const selectors = ["article","[class*='complaint-item']","[class*='complaint_item']",
-                       "[class*='complaint-card']","[class*='complaintCard']"];
+    // Find cards
+    const selectors = [
+      "article",
+      "[class*='complaint-item']",
+      "[class*='complaint_item']",
+      "[class*='complaint-card']",
+      "[class*='complaintCard']",
+    ];
     let cards = [];
     for (const sel of selectors) {
       const found = Array.from(document.querySelectorAll(sel));
@@ -106,10 +115,8 @@ async function scrapeList(page) {
       });
     }
 
-    // Count status ONCE per card by finding the status element
+    // Count status ONCE per card
     cards.forEach(card => {
-      // Find the status badge — it's typically the first/most prominent text
-      // that exactly matches a status word
       const statusEl = card.querySelector(
         "[class*='status'],[class*='badge'],[class*='label'],[class*='state']"
       );
@@ -117,18 +124,15 @@ async function scrapeList(page) {
       if (statusEl) {
         status = statusEl.textContent.trim().toUpperCase();
       } else {
-        // Fallback: find leaf node with exact status text
-        const leaves = Array.from(card.querySelectorAll("*")).filter(el =>
-          el.children.length === 0
-        );
+        const leaves = Array.from(card.querySelectorAll("*"))
+          .filter(el => el.children.length === 0);
         for (const leaf of leaves) {
           const t = leaf.textContent.trim().toUpperCase();
-          if (t === "RESOLVED" || t === "REJECTED" || t === "UNRESOLVED" || t === "OPEN") {
+          if (["RESOLVED","REJECTED","UNRESOLVED","OPEN"].includes(t)) {
             status = t; break;
           }
         }
       }
-
       if (status === "RESOLVED")   r.resolved++;
       if (status === "REJECTED")   r.rejected++;
       if (status === "UNRESOLVED") r.unresolved++;
@@ -144,7 +148,11 @@ async function scrapeList(page) {
         const hoursLeft = parseInt(m[1]);
         const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
         if (!r.openEntries.find(e => e.url === url)) {
-          r.openEntries.push({ hoursLeft, timer: d>0?(d+"d "+h+"h"):(h+"h"), url });
+          r.openEntries.push({
+            hoursLeft,
+            timer: d > 0 ? (d+"d "+h+"h") : (h+"h"),
+            url
+          });
         }
       }
     });
@@ -159,14 +167,14 @@ async function scrapeList(page) {
   });
 }
 
-// ── Scrape one casino URL (reuses shared browser) ─────────────────
+// ── Scrape one casino ──────────────────────────────────────────────
 async function scrapeCasino(url) {
-  const browser = await getBrowser();
-  let page;
+  let browser;
   try {
-    page = await openPage(browser, url);
+    browser = await launchBrowser();
+    const page  = await openPage(browser, url);
     const title = await page.title();
-    console.log("[scrape] " + url + " → " + title);
+    console.log("[scrape] " + url.split("/").slice(-2).join("/") + " → " + title);
 
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return { ok: false, error: "Cloudflare block" };
@@ -175,7 +183,7 @@ async function scrapeCasino(url) {
     const data       = await scrapeList(page);
     const allEntries = [...data.openEntries];
 
-    // Pagination — navigate within same page
+    // Pagination
     for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
       const sep   = url.includes("?") ? "&" : "?";
       const pgUrl = url + sep + "page=" + pg;
@@ -184,12 +192,6 @@ async function scrapeCasino(url) {
         await page.waitForFunction(
           () => !document.title.includes("Just a moment") && document.title.length > 0,
           { timeout: 15000, polling: 500 }
-        );
-      } catch(e) {}
-      try {
-        await page.waitForFunction(
-          () => document.querySelector("article,[class*='complaint-item'],a[href*='casino-complaints']") !== null,
-          { timeout: 8000, polling: 500 }
         );
       } catch(e) {}
       const pgData = await scrapeList(page);
@@ -212,65 +214,30 @@ async function scrapeCasino(url) {
       total:      data.resolved + data.rejected + data.unresolved + data.open,
       openEntries: allEntries,
     };
+
+  } catch(e) {
+    console.error("[error] " + e.message);
+    return { ok: false, error: e.message };
   } finally {
-    // Close page but keep browser alive
-    if (page) { try { await page.close(); } catch(e) {} }
+    if (browser) {
+      try { await browser.close(); } catch(e) {}
+    }
   }
 }
 
-// ── Main handler ───────────────────────────────────────────────────
+// ── Routes ─────────────────────────────────────────────────────────
 app.get("/api/scrape", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-
   if (SECRET && req.query.secret !== SECRET) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
-
   const { url } = req.query;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
 
-  try {
-    const result = await scrapeCasino(decodeURIComponent(url));
-    res.json(result);
-  } catch(e) {
-    console.error("[error] " + e.message);
-    // Browser may have crashed — reset it
-    sharedBrowser = null;
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  const result = await scrapeCasino(decodeURIComponent(url));
+  res.json(result);
 });
 
-// ── Batch handler — scrapes multiple URLs in one request ──────────
-// Called by GAS with ?urls=URL1,URL2,URL3 (comma separated, encoded)
-app.get("/api/batch", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+app.get("/", (req, res) => res.json({ status: "AG Scraper running" }));
 
-  if (SECRET && req.query.secret !== SECRET) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  const rawUrls = req.query.urls;
-  if (!rawUrls) return res.status(400).json({ ok: false, error: "Missing ?urls=" });
-
-  const urls = rawUrls.split(",").map(u => decodeURIComponent(u.trim())).filter(Boolean);
-  if (urls.length === 0) return res.status(400).json({ ok: false, error: "No valid URLs" });
-
-  console.log("[batch] Processing " + urls.length + " URLs");
-
-  const results = [];
-  for (const url of urls) {
-    try {
-      const r = await scrapeCasino(url);
-      results.push({ url, ...r });
-    } catch(e) {
-      console.error("[batch] Error for " + url + ": " + e.message);
-      sharedBrowser = null; // reset on crash
-      results.push({ url, ok: false, error: e.message });
-    }
-  }
-
-  res.json({ ok: true, results });
-});
-
-app.get("/", (req, res) => res.json({ status: "AG Scraper running", browserAlive: !!sharedBrowser }));
 app.listen(PORT, () => console.log("AG Scraper listening on port " + PORT));
