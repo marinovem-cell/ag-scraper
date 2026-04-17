@@ -560,3 +560,4 @@ app.get("/api/scrape", async (req, res) => {
 app.get("/", (req, res) => res.json({ status: "AG Scraper running" }));
 
 app.listen(PORT, () => console.log("AG Scraper listening on port " + PORT));
+
