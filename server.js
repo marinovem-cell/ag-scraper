@@ -234,8 +234,21 @@ app.get("/api/scrape", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
 
-  const result = await scrapeCasino(decodeURIComponent(url));
-  res.json(result);
+  // Hard 70s timeout — GAS must get a response before its 6-min limit
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Render timeout after 70s")), 70000)
+  );
+
+  try {
+    const result = await Promise.race([
+      scrapeCasino(decodeURIComponent(url)),
+      timeout
+    ]);
+    res.json(result);
+  } catch(e) {
+    console.error("[error] " + e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get("/", (req, res) => res.json({ status: "AG Scraper running" }));
