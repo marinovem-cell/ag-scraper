@@ -17,8 +17,12 @@ const MEMORY_RESTART_MB       = 380;    // proactively restart browser if RSS ex
 const MEMORY_CHECK_INTERVAL   = 30000;  // memory check every 30s
 const PROTOCOL_TIMEOUT        = 60000;  // max time for a single Chrome command to respond
 const LAUNCH_TIMEOUT          = 45000;  // max time to wait for Chrome to start
-const SCRAPE_TIMEOUT          = 75000;  // max time for a full scrape (one attempt)
+const NAV_TIMEOUT             = 15000;  // page.goto timeout (down from 25s — fail fast on CF)
+const TITLE_WAIT_TIMEOUT      = 15000;  // wait for real title (down from 20s)
+const SCRAPE_TIMEOUT          = 65000;  // max time for a full scrape (one attempt)
 const MAX_SCRAPES_PER_BROWSER = 25;     // restart browser every N scrapes for hygiene
+const CONSECUTIVE_FAIL_LIMIT  = 3;      // after N failures in a row → force cooldown
+const COOLDOWN_MS             = 20000;  // 20s cooldown between batches of failures
 
 // ══════════════════════════════════════════════════════════════════
 // WEBSHARE PROXY CONFIG
@@ -53,12 +57,13 @@ function getProxyForUrl(url) {
 // ══════════════════════════════════════════════════════════════════
 
 let state = {
-  browser:     null,
-  mode:        null,   // 'direct' | 'proxy'
-  proxyHost:   null,
-  scrapeCount: 0,
-  launchedAt:  null,
-  launchLock:  null,   // prevent concurrent launches
+  browser:          null,
+  mode:             null,   // 'direct' | 'proxy'
+  proxyHost:        null,
+  scrapeCount:      0,
+  consecutiveFails: 0,
+  launchedAt:       null,
+  launchLock:       null,
 };
 
 function memMB() {
@@ -70,7 +75,7 @@ function log(msg) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// BROWSER LAUNCH (internal — use getBrowser)
+// BROWSER LAUNCH
 // ══════════════════════════════════════════════════════════════════
 
 async function launchBrowserInternal(mode, proxyHost) {
@@ -100,7 +105,7 @@ async function launchBrowserInternal(mode, proxyHost) {
     "--no-pings",
     "--password-store=basic",
     "--use-mock-keychain",
-    "--js-flags=--max-old-space-size=256",   // cap V8 heap
+    "--js-flags=--max-old-space-size=256",
   ];
 
   if (mode === "proxy" && proxyHost) {
@@ -131,12 +136,7 @@ async function launchBrowserInternal(mode, proxyHost) {
   return Promise.race([launchPromise, timeout]);
 }
 
-// ══════════════════════════════════════════════════════════════════
-// GET BROWSER (reuses persistent browser if mode matches)
-// ══════════════════════════════════════════════════════════════════
-
 async function getBrowser(mode, proxyHost) {
-  // Wait for any in-progress launch to finish
   if (state.launchLock) {
     try { await state.launchLock; } catch (e) {}
   }
@@ -144,7 +144,6 @@ async function getBrowser(mode, proxyHost) {
   const modeMatches = state.mode === mode &&
                       (mode !== "proxy" || state.proxyHost === proxyHost);
 
-  // Reuse existing browser if mode matches AND it's healthy AND scrape count OK
   if (state.browser && modeMatches) {
     try {
       await state.browser.version();
@@ -158,13 +157,11 @@ async function getBrowser(mode, proxyHost) {
     state.browser = null;
   }
 
-  // Close existing browser (mode switch or unhealthy or at limit)
   if (state.browser) {
     try { await state.browser.close(); } catch (e) {}
     state.browser = null;
   }
 
-  // Launch new browser (protected from concurrent launches)
   state.launchLock = (async () => {
     state.browser     = await launchBrowserInternal(mode, proxyHost);
     state.mode        = mode;
@@ -233,14 +230,14 @@ async function openPage(browser, url, useProxy) {
       "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
 
     try {
       await page.waitForFunction(
         () => !document.title.includes("Just a moment") &&
               !document.title.includes("Attention Required") &&
               document.title.length > 0,
-        { timeout: 20000, polling: 500 }
+        { timeout: TITLE_WAIT_TIMEOUT, polling: 500 }
       );
     } catch (e) {}
 
@@ -249,7 +246,7 @@ async function openPage(browser, url, useProxy) {
         () => document.querySelector(
           "article,[class*='complaint-item'],[class*='complaint-card'],a[href*='casino-complaints']"
         ) !== null,
-        { timeout: 10000, polling: 500 }
+        { timeout: 8000, polling: 500 }
       );
     } catch (e) {}
 
@@ -261,7 +258,7 @@ async function openPage(browser, url, useProxy) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// SCRAPE LIST (unchanged — the parsing logic works well)
+// SCRAPE LIST
 // ══════════════════════════════════════════════════════════════════
 
 async function scrapeList(page) {
@@ -337,7 +334,20 @@ async function scrapeList(page) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// SCRAPE ONE CASINO (uses persistent browser)
+// DETECT IF AN ERROR LOOKS LIKE CLOUDFLARE
+// ══════════════════════════════════════════════════════════════════
+
+function isCloudflareError(err) {
+  if (!err || !err.message) return false;
+  const m = err.message.toLowerCase();
+  return m.includes("navigation timeout") ||
+         m.includes("net::err_timed_out") ||
+         m.includes("net::err_tunnel_connection_failed") ||
+         m.includes("net::err_empty_response");
+}
+
+// ══════════════════════════════════════════════════════════════════
+// SCRAPE ONE CASINO
 // ══════════════════════════════════════════════════════════════════
 
 async function scrapeCasino(url, mode, proxyHost) {
@@ -360,11 +370,11 @@ async function scrapeCasino(url, mode, proxyHost) {
     for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
       const sep   = url.includes("?") ? "&" : "?";
       const pgUrl = url + sep + "page=" + pg;
-      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
       try {
         await page.waitForFunction(
           () => !document.title.includes("Just a moment") && document.title.length > 0,
-          { timeout: 12000, polling: 500 }
+          { timeout: 10000, polling: 500 }
         );
       } catch (e) {}
       const pgData = await scrapeList(page);
@@ -392,7 +402,11 @@ async function scrapeCasino(url, mode, proxyHost) {
 
   } catch (e) {
     console.error(`[scrape error] ${e.message}`);
-    // Reset browser only on fatal errors
+
+    // Treat nav timeouts as Cloudflare blocks — they usually are
+    const looksLikeCF = isCloudflareError(e);
+
+    // Reset browser only on truly fatal errors
     const fatal = [
       "Target closed", "Protocol error", "WS endpoint",
       "Browser launch timeout", "frame was detached", "Session closed"
@@ -400,7 +414,12 @@ async function scrapeCasino(url, mode, proxyHost) {
     if (fatal.some(f => e.message.includes(f))) {
       await resetBrowser("fatal: " + e.message);
     }
-    return { ok: false, error: e.message };
+
+    return {
+      ok:        false,
+      error:     e.message,
+      cfBlocked: looksLikeCF  // triggers proxy fallback in the route
+    };
   } finally {
     if (page) {
       try {
@@ -412,14 +431,14 @@ async function scrapeCasino(url, mode, proxyHost) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// MEMORY MONITOR — proactively restart before OOM kill
+// MEMORY MONITOR
 // ══════════════════════════════════════════════════════════════════
 
 setInterval(async () => {
   const usage  = process.memoryUsage();
   const rssMB  = Math.round(usage.rss / 1024 / 1024);
   const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
-  console.log(`[health] RSS=${rssMB}MB heap=${heapMB}MB scrapes=${state.scrapeCount} mode=${state.mode || "none"}`);
+  console.log(`[health] RSS=${rssMB}MB heap=${heapMB}MB scrapes=${state.scrapeCount} fails=${state.consecutiveFails} mode=${state.mode || "none"}`);
 
   if (rssMB > MEMORY_RESTART_MB) {
     console.log(`[health] Memory ${rssMB}MB > ${MEMORY_RESTART_MB}MB → restart browser`);
@@ -429,7 +448,7 @@ setInterval(async () => {
 }, MEMORY_CHECK_INTERVAL);
 
 // ══════════════════════════════════════════════════════════════════
-// MAIN ROUTE
+// MAIN ROUTE — direct → proxy fallback → cooldown on consecutive fails
 // ══════════════════════════════════════════════════════════════════
 
 const withTimeout = (promise, ms, label) => Promise.race([
@@ -448,18 +467,26 @@ app.get("/api/scrape", async (req, res) => {
   const decodedUrl = decodeURIComponent(url);
   const startTime  = Date.now();
 
+  // If we've had too many consecutive failures, cool down before attempting
+  if (state.consecutiveFails >= CONSECUTIVE_FAIL_LIMIT) {
+    console.log(`[cooldown] ${state.consecutiveFails} consecutive fails → forcing browser reset + ${COOLDOWN_MS/1000}s cooldown`);
+    await resetBrowser("consecutive failures cooldown");
+    await new Promise(r => setTimeout(r, COOLDOWN_MS));
+    state.consecutiveFails = 0;
+  }
+
   try {
-    // ── Attempt 1: Direct ───────────────────────────────────────
+    // ── Attempt 1: Direct ─────────────────────────────────────────
     let result = await withTimeout(
       scrapeCasino(decodedUrl, "direct", null),
       SCRAPE_TIMEOUT,
       "Direct"
     );
 
-    // ── Attempt 2: Proxy (deterministic) ────────────────────────
-    if (result.cfBlocked && hasProxy) {
+    // ── Attempt 2: Proxy (if direct was blocked or timed out) ────
+    if (!result.ok && result.cfBlocked && hasProxy) {
       const proxy = getProxyForUrl(decodedUrl);
-      console.log(`[fallback] Direct CF-blocked → proxy ${proxy.host}`);
+      console.log(`[fallback] Direct blocked/timeout → proxy ${proxy.host}`);
       result = await withTimeout(
         scrapeCasino(decodedUrl, "proxy", proxy.host),
         SCRAPE_TIMEOUT,
@@ -467,16 +494,21 @@ app.get("/api/scrape", async (req, res) => {
       );
     }
 
-    // NOTE: Removed the old 3rd attempt (direct again). It wasted memory
-    // on already-blocked casinos. GAS retryAskGamblersErrors handles these later.
+    // Track consecutive failures for proactive cooldown
+    if (result.ok) {
+      state.consecutiveFails = 0;
+    } else {
+      state.consecutiveFails++;
+    }
 
     const dur = Date.now() - startTime;
     const tag = result.ok ? "✓" : "✗";
-    console.log(`[result] ${tag} ${decodedUrl.split("/").slice(-2).join("/")} (${dur}ms)`);
+    console.log(`[result] ${tag} ${decodedUrl.split("/").slice(-2).join("/")} (${dur}ms) fails=${state.consecutiveFails}`);
     res.json(result);
 
   } catch (e) {
     console.error(`[route error] ${e.message}`);
+    state.consecutiveFails++;
     await resetBrowser("route error");
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -490,16 +522,17 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v2-persistent-browser",
+    version: "v3-cf-aware",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
     },
     browser: state.browser ? {
-      mode:       state.mode,
-      proxy_host: state.proxyHost,
-      scrapes:    state.scrapeCount,
-      uptime_s:   state.launchedAt ? Math.round((Date.now() - state.launchedAt) / 1000) : 0,
+      mode:              state.mode,
+      proxy_host:        state.proxyHost,
+      scrapes:           state.scrapeCount,
+      consecutive_fails: state.consecutiveFails,
+      uptime_s:          state.launchedAt ? Math.round((Date.now() - state.launchedAt) / 1000) : 0,
     } : null,
     proxy: hasProxy ? "WebShare configured" : "No proxy — direct only",
   });
@@ -508,12 +541,13 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
-    ok:            true,
-    rss_mb:        Math.round(usage.rss / 1024 / 1024),
-    heap_mb:       Math.round(usage.heapUsed / 1024 / 1024),
-    browser_alive: !!state.browser,
-    browser_mode:  state.mode,
-    scrape_count:  state.scrapeCount,
+    ok:                true,
+    rss_mb:            Math.round(usage.rss / 1024 / 1024),
+    heap_mb:           Math.round(usage.heapUsed / 1024 / 1024),
+    browser_alive:     !!state.browser,
+    browser_mode:      state.mode,
+    scrape_count:      state.scrapeCount,
+    consecutive_fails: state.consecutiveFails,
   });
 });
 
@@ -535,4 +569,4 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandled] ${reason}`);
 });
 
-app.listen(PORT, () => console.log("AG Scraper v2 listening on port " + PORT));
+app.listen(PORT, () => console.log("AG Scraper v3 listening on port " + PORT));
