@@ -13,38 +13,41 @@ const CHROME = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 // CONFIGURATION
 // ══════════════════════════════════════════════════════════════════
 
-const MEMORY_RESTART_MB       = 380;    // proactively restart browser if RSS exceeds this
-const MEMORY_CHECK_INTERVAL   = 30000;  // memory check every 30s
-const PROTOCOL_TIMEOUT        = 60000;  // max time for a single Chrome command to respond
-const LAUNCH_TIMEOUT          = 45000;  // max time to wait for Chrome to start
-const NAV_TIMEOUT             = 15000;  // page.goto timeout (down from 25s — fail fast on CF)
-const TITLE_WAIT_TIMEOUT      = 15000;  // wait for real title (down from 20s)
-const SCRAPE_TIMEOUT          = 65000;  // max time for a full scrape (one attempt)
-const MAX_SCRAPES_PER_BROWSER = 25;     // restart browser every N scrapes for hygiene
-const CONSECUTIVE_FAIL_LIMIT  = 3;      // after N failures in a row → force cooldown
-const COOLDOWN_MS             = 20000;  // 20s cooldown between batches of failures
+const MEMORY_RESTART_MB       = 380;
+const MEMORY_CHECK_INTERVAL   = 30000;
+const PROTOCOL_TIMEOUT        = 60000;
+const LAUNCH_TIMEOUT          = 45000;
+const NAV_TIMEOUT             = 15000;
+const TITLE_WAIT_TIMEOUT      = 15000;
+const SCRAPE_TIMEOUT          = 65000;
+const MAX_SCRAPES_PER_BROWSER = 25;
+const CONSECUTIVE_FAIL_LIMIT  = 3;
+const COOLDOWN_MS             = 20000;
 
 // ══════════════════════════════════════════════════════════════════
-// WEBSHARE PROXY CONFIG
+// WEBSHARE PROXY CONFIG — all env-driven, fail fast if missing
 // ══════════════════════════════════════════════════════════════════
 
-const WS_USER = process.env.WS_PROXY_USER || "YOUR_WEBSHARE_USERNAME";
-const WS_PASS = process.env.WS_PROXY_PASS || "YOUR_WEBSHARE_PASSWORD";
+const WS_USER = process.env.WS_PROXY_USER;
+const WS_PASS = process.env.WS_PROXY_PASS;
 
-const WS_PROXIES = [
-  { host: "31.59.20.176",    port: "6754" },
-  { host: "198.23.239.134",  port: "6540" },
-  { host: "45.38.107.97",    port: "6014" },
-  { host: "107.172.163.27",  port: "6543" },
-  { host: "198.105.121.200", port: "6462" },
-  { host: "216.10.27.159",   port: "6837" },
-  { host: "142.111.67.146",  port: "5611" },
-  { host: "191.96.254.138",  port: "6185" },
-  { host: "31.58.9.4",       port: "6077" },
-  { host: "23.26.71.145",    port: "5628" },
-];
+if (!WS_USER || !WS_PASS) {
+  console.error("FATAL: WS_PROXY_USER and/or WS_PROXY_PASS env vars missing");
+  process.exit(1);
+}
 
-const hasProxy = WS_USER !== "YOUR_WEBSHARE_USERNAME" && WS_PROXIES[0].host !== "YOUR_IP_1";
+let WS_PROXIES;
+try {
+  WS_PROXIES = JSON.parse(process.env.WS_PROXIES || "[]");
+} catch (e) {
+  console.error("FATAL: WS_PROXIES env var is not valid JSON:", e.message);
+  process.exit(1);
+}
+if (!Array.isArray(WS_PROXIES) || WS_PROXIES.length === 0) {
+  console.error("FATAL: WS_PROXIES env var is empty or not an array");
+  process.exit(1);
+}
+console.log(`[startup] Loaded ${WS_PROXIES.length} proxies from WS_PROXIES env var`);
 
 // Deterministic proxy per URL — same casino consistently uses same IP (builds CF trust)
 function getProxyForUrl(url) {
@@ -58,7 +61,7 @@ function getProxyForUrl(url) {
 
 let state = {
   browser:          null,
-  mode:             null,   // 'direct' | 'proxy'
+  mode:             null,
   proxyHost:        null,
   scrapeCount:      0,
   consecutiveFails: 0,
@@ -403,10 +406,8 @@ async function scrapeCasino(url, mode, proxyHost) {
   } catch (e) {
     console.error(`[scrape error] ${e.message}`);
 
-    // Treat nav timeouts as Cloudflare blocks — they usually are
     const looksLikeCF = isCloudflareError(e);
 
-    // Reset browser only on truly fatal errors
     const fatal = [
       "Target closed", "Protocol error", "WS endpoint",
       "Browser launch timeout", "frame was detached", "Session closed"
@@ -418,7 +419,7 @@ async function scrapeCasino(url, mode, proxyHost) {
     return {
       ok:        false,
       error:     e.message,
-      cfBlocked: looksLikeCF  // triggers proxy fallback in the route
+      cfBlocked: looksLikeCF
     };
   } finally {
     if (page) {
@@ -448,7 +449,7 @@ setInterval(async () => {
 }, MEMORY_CHECK_INTERVAL);
 
 // ══════════════════════════════════════════════════════════════════
-// MAIN ROUTE — direct → proxy fallback → cooldown on consecutive fails
+// MAIN ROUTE
 // ══════════════════════════════════════════════════════════════════
 
 const withTimeout = (promise, ms, label) => Promise.race([
@@ -467,7 +468,6 @@ app.get("/api/scrape", async (req, res) => {
   const decodedUrl = decodeURIComponent(url);
   const startTime  = Date.now();
 
-  // If we've had too many consecutive failures, cool down before attempting
   if (state.consecutiveFails >= CONSECUTIVE_FAIL_LIMIT) {
     console.log(`[cooldown] ${state.consecutiveFails} consecutive fails → forcing browser reset + ${COOLDOWN_MS/1000}s cooldown`);
     await resetBrowser("consecutive failures cooldown");
@@ -476,15 +476,13 @@ app.get("/api/scrape", async (req, res) => {
   }
 
   try {
-    // ── Attempt 1: Direct ─────────────────────────────────────────
     let result = await withTimeout(
       scrapeCasino(decodedUrl, "direct", null),
       SCRAPE_TIMEOUT,
       "Direct"
     );
 
-    // ── Attempt 2: Proxy (if direct was blocked or timed out) ────
-    if (!result.ok && result.cfBlocked && hasProxy) {
+    if (!result.ok && result.cfBlocked) {
       const proxy = getProxyForUrl(decodedUrl);
       console.log(`[fallback] Direct blocked/timeout → proxy ${proxy.host}`);
       result = await withTimeout(
@@ -494,7 +492,6 @@ app.get("/api/scrape", async (req, res) => {
       );
     }
 
-    // Track consecutive failures for proactive cooldown
     if (result.ok) {
       state.consecutiveFails = 0;
     } else {
@@ -522,7 +519,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v3-cf-aware",
+    version: "v4-env-driven-proxies",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
@@ -534,7 +531,7 @@ app.get("/", (req, res) => {
       consecutive_fails: state.consecutiveFails,
       uptime_s:          state.launchedAt ? Math.round((Date.now() - state.launchedAt) / 1000) : 0,
     } : null,
-    proxy: hasProxy ? "WebShare configured" : "No proxy — direct only",
+    proxy_pool_size: WS_PROXIES.length,
   });
 });
 
@@ -569,4 +566,4 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandled] ${reason}`);
 });
 
-app.listen(PORT, () => console.log("AG Scraper v3 listening on port " + PORT));
+app.listen(PORT, () => console.log("AG Scraper v4 listening on port " + PORT));
