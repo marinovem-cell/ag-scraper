@@ -24,30 +24,102 @@ const MAX_SCRAPES_PER_BROWSER = 25;
 const CONSECUTIVE_FAIL_LIMIT  = 3;
 const COOLDOWN_MS             = 20000;
 
+const WS_REFRESH_INTERVAL_MS  = 6 * 60 * 60 * 1000;  // refresh proxy list every 6 hours
+const WS_FETCH_TIMEOUT_MS     = 15000;               // 15s timeout for WebShare API calls
+const WS_FETCH_RETRY_DELAY_MS = 5000;                // 5s between startup fetch retries
+const WS_FETCH_MAX_RETRIES    = 3;                   // try 3 times on cold start before giving up
+
 // ══════════════════════════════════════════════════════════════════
-// WEBSHARE PROXY CONFIG — all env-driven, fail fast if missing
+// WEBSHARE PROXY CONFIG — fetched from WebShare API at startup
 // ══════════════════════════════════════════════════════════════════
 
-const WS_USER = process.env.WS_PROXY_USER;
-const WS_PASS = process.env.WS_PROXY_PASS;
+const WS_API_KEY = process.env.WS_API_KEY;
 
-if (!WS_USER || !WS_PASS) {
-  console.error("FATAL: WS_PROXY_USER and/or WS_PROXY_PASS env vars missing");
+if (!WS_API_KEY) {
+  console.error("FATAL: WS_API_KEY env var missing");
   process.exit(1);
 }
 
-let WS_PROXIES;
-try {
-  WS_PROXIES = JSON.parse(process.env.WS_PROXIES || "[]");
-} catch (e) {
-  console.error("FATAL: WS_PROXIES env var is not valid JSON:", e.message);
-  process.exit(1);
+let WS_USER       = null;
+let WS_PASS       = null;
+let WS_PROXIES    = [];
+let WS_LAST_FETCH = 0;
+
+async function fetchProxiesFromWebshare() {
+  const url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25";
+
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), WS_FETCH_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(url, {
+      headers: { "Authorization": "Token " + WS_API_KEY },
+      signal:  controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "(no body)");
+      throw new Error(`WebShare API returned ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    if (!data.results || !Array.isArray(data.results) || data.results.length === 0) {
+      throw new Error("WebShare API returned empty proxy list");
+    }
+
+    const newProxies = data.results.map(p => ({
+      host: String(p.proxy_address),
+      port: String(p.port),
+    }));
+
+    // All proxies in a WebShare account share one username/password
+    const newUser = data.results[0].username;
+    const newPass = data.results[0].password;
+
+    if (!newUser || !newPass) {
+      throw new Error("WebShare API response missing username/password");
+    }
+
+    WS_PROXIES    = newProxies;
+    WS_USER       = newUser;
+    WS_PASS       = newPass;
+    WS_LAST_FETCH = Date.now();
+
+    console.log(`[webshare] Loaded ${WS_PROXIES.length} proxies from API (user=${WS_USER})`);
+    return true;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
 }
-if (!Array.isArray(WS_PROXIES) || WS_PROXIES.length === 0) {
-  console.error("FATAL: WS_PROXIES env var is empty or not an array");
-  process.exit(1);
-}
-console.log(`[startup] Loaded ${WS_PROXIES.length} proxies from WS_PROXIES env var`);
+
+// Block startup until proxies are loaded — retry a few times for cold-start hiccups
+(async () => {
+  for (let attempt = 1; attempt <= WS_FETCH_MAX_RETRIES; attempt++) {
+    try {
+      await fetchProxiesFromWebshare();
+      return;
+    } catch (e) {
+      console.error(`[webshare] Startup fetch attempt ${attempt}/${WS_FETCH_MAX_RETRIES} failed: ${e.message}`);
+      if (attempt < WS_FETCH_MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, WS_FETCH_RETRY_DELAY_MS));
+      } else {
+        console.error("FATAL: Could not fetch proxies from WebShare API after all retries");
+        process.exit(1);
+      }
+    }
+  }
+})();
+
+// Periodic refresh — picks up rotated IPs without needing a redeploy
+setInterval(async () => {
+  try {
+    await fetchProxiesFromWebshare();
+  } catch (e) {
+    console.error(`[webshare] Background refresh failed (keeping previous list): ${e.message}`);
+  }
+}, WS_REFRESH_INTERVAL_MS);
 
 // Deterministic proxy per URL — same casino consistently uses same IP (builds CF trust)
 function getProxyForUrl(url) {
@@ -465,6 +537,11 @@ app.get("/api/scrape", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
 
+  // Sanity check: WebShare proxies must be loaded by this point
+  if (WS_PROXIES.length === 0 || !WS_USER || !WS_PASS) {
+    return res.status(503).json({ ok: false, error: "Proxy list not yet loaded" });
+  }
+
   const decodedUrl = decodeURIComponent(url);
   const startTime  = Date.now();
 
@@ -519,7 +596,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v4-env-driven-proxies",
+    version: "v5-webshare-api",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
@@ -531,7 +608,11 @@ app.get("/", (req, res) => {
       consecutive_fails: state.consecutiveFails,
       uptime_s:          state.launchedAt ? Math.round((Date.now() - state.launchedAt) / 1000) : 0,
     } : null,
-    proxy_pool_size: WS_PROXIES.length,
+    webshare: {
+      proxy_pool_size:    WS_PROXIES.length,
+      last_fetch_age_min: WS_LAST_FETCH ? Math.round((Date.now() - WS_LAST_FETCH) / 60000) : null,
+      user:               WS_USER,
+    },
   });
 });
 
@@ -545,7 +626,21 @@ app.get("/health", (req, res) => {
     browser_mode:      state.mode,
     scrape_count:      state.scrapeCount,
     consecutive_fails: state.consecutiveFails,
+    proxy_pool_size:   WS_PROXIES.length,
   });
+});
+
+// Manual proxy refresh — useful for debugging or after WebShare manual rotation
+app.get("/refresh-proxies", async (req, res) => {
+  if (SECRET && req.query.secret !== SECRET) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    await fetchProxiesFromWebshare();
+    res.json({ ok: true, proxy_pool_size: WS_PROXIES.length, user: WS_USER });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -566,4 +661,4 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandled] ${reason}`);
 });
 
-app.listen(PORT, () => console.log("AG Scraper v4 listening on port " + PORT));
+app.listen(PORT, () => console.log("AG Scraper v5 listening on port " + PORT));
