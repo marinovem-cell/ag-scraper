@@ -1,6 +1,7 @@
 const express   = require("express");
 const puppeteer = require("puppeteer-extra");
 const Stealth   = require("puppeteer-extra-plugin-stealth");
+const proxyChain = require("proxy-chain");
 const crypto    = require("crypto");
 puppeteer.use(Stealth());
 
@@ -139,7 +140,17 @@ let state = {
   consecutiveFails: 0,
   launchedAt:       null,
   launchLock:       null,
+  anonProxyUrl:     null,   // proxy-chain local anonymized URL for the current browser
 };
+
+// Close the current anonymized proxy (if any). Safe to call repeatedly.
+async function closeAnonProxy() {
+  if (state.anonProxyUrl) {
+    const old = state.anonProxyUrl;
+    state.anonProxyUrl = null;
+    try { await proxyChain.closeAnonymizedProxy(old, true); } catch (e) {}
+  }
+}
 
 function memMB() {
   return Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -183,11 +194,20 @@ async function launchBrowserInternal(mode, proxyHost) {
     "--js-flags=--max-old-space-size=256",
   ];
 
+// Always clear any leftover anonymized proxy before launching a new browser.
+  await closeAnonProxy();
+
   if (mode === "proxy" && proxyHost) {
     const proxy = WS_PROXIES.find(p => p.host === proxyHost);
     if (proxy) {
-      args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
-      log(`[browser] Launching PROXY ${proxy.host}:${proxy.port}`);
+      // proxy-chain: wrap the authenticated upstream proxy in a local, auth-free
+      // proxy. Chromium then connects to 127.0.0.1 with NO auth challenge, which
+      // avoids the page.authenticate() + setRequestInterception() hang that causes
+      // 65s "Proxy timeout" on residential proxies.
+      const upstream = `http://${encodeURIComponent(WS_USER)}:${encodeURIComponent(WS_PASS)}@${proxy.host}:${proxy.port}`;
+      state.anonProxyUrl = await proxyChain.anonymizeProxy(upstream);
+      args.push(`--proxy-server=${state.anonProxyUrl}`);
+      log(`[browser] Launching PROXY ${proxy.host}:${proxy.port} via local ${state.anonProxyUrl}`);
     }
   } else {
     log(`[browser] Launching DIRECT`);
@@ -269,6 +289,7 @@ async function resetBrowser(reason) {
   if (state.browser) {
     try { await state.browser.close(); } catch (e) {}
   }
+  await closeAnonProxy();
   state.browser     = null;
   state.mode        = null;
   state.proxyHost   = null;
@@ -282,10 +303,10 @@ async function resetBrowser(reason) {
 async function openPage(browser, url, useProxy) {
   const page = await browser.newPage();
 
-  try {
-    if (useProxy) {
-      await page.authenticate({ username: WS_USER, password: WS_PASS });
-    }
+ try {
+    // NOTE: proxy auth is handled by the local proxy-chain proxy (credentials are
+    // embedded there), so we deliberately do NOT call page.authenticate() — doing
+    // so together with setRequestInterception() hangs residential proxy handshakes.
 
     await page.setRequestInterception(true);
     page.on("request", req => {
