@@ -21,7 +21,7 @@ const LAUNCH_TIMEOUT          = 45000;
 const NAV_TIMEOUT             = 15000;
 const TITLE_WAIT_TIMEOUT      = 15000;
 const SCRAPE_TIMEOUT          = 65000;
-const MAX_SCRAPES_PER_BROWSER = 25;
+const MAX_SCRAPES_PER_BROWSER = 8;
 const CONSECUTIVE_FAIL_LIMIT  = 3;
 const COOLDOWN_MS             = 20000;
 
@@ -191,7 +191,7 @@ async function launchBrowserInternal(mode, proxyHost) {
     "--no-pings",
     "--password-store=basic",
     "--use-mock-keychain",
-    "--js-flags=--max-old-space-size=256",
+    "--js-flags=--max-old-space-size=128",
   ];
 
 // Always clear any leftover anonymized proxy before launching a new browser.
@@ -463,7 +463,7 @@ async function scrapeCasino(url, mode, proxyHost) {
     const data       = await scrapeList(page);
     const allEntries = [...data.openEntries];
 
-    for (let pg = 2; pg <= data.totalPages && pg <= 50; pg++) {
+    for (let pg = 2; pg <= data.totalPages && pg <= 15; pg++) {
       const sep   = url.includes("?") ? "&" : "?";
       const pgUrl = url + sep + "page=" + pg;
       await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
@@ -566,6 +566,13 @@ app.get("/api/scrape", async (req, res) => {
   const decodedUrl = decodeURIComponent(url);
   const startTime  = Date.now();
 
+// Proactive memory guard — reset the browser before it can OOM the 512MB instance.
+  const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  if (rssMB > 380 && state.browser) {
+    console.log(`[memguard] RSS=${rssMB}MB > 380MB → forcing browser reset before scrape`);
+    await resetBrowser("memory guard");
+  }
+  
   if (state.consecutiveFails >= CONSECUTIVE_FAIL_LIMIT) {
     console.log(`[cooldown] ${state.consecutiveFails} consecutive fails → forcing browser reset + ${COOLDOWN_MS/1000}s cooldown`);
     await resetBrowser("consecutive failures cooldown");
