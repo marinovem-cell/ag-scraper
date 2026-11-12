@@ -52,7 +52,7 @@ Apps Script runs daily, reads pending casinos, calls
 ## Environment variables (set per-service in Render, not in this repo)
 - `WS_API_KEY` — **required** (exits on startup if missing). Selects the proxy pool.
 - `AG_SECRET` — if set, requests must pass matching `?secret=`; if unset, skipped. The
-  GAS sends `secret=agsecret`.
+  GAS sends it as `?secret=`. **Never write its value in this repo — the repo is public.**
 - `CHROMIUM_PATH` — Chromium binary (default `/usr/bin/chromium`).
 - `PORT` — provided by Render.
 
@@ -67,7 +67,28 @@ Apps Script runs daily, reads pending casinos, calls
    fallback: `getProxyForUrl(url)` picks one proxy deterministically (md5(url) → same
    casino, same IP, builds CF trust), then `scrapeCasino(url, "proxy", host)`.
 4. Returns `{ ok, title, resolved, rejected, unresolved, open, total, openEntries[] }`
-   or `{ ok:false, error, cfBlocked }`.
+   or `{ ok:false, error, cfBlocked }`. `openEntries[]` = `{ hoursLeft, timer:"2d 7h", url }`.
+   Only `askgamblers.com` URLs are accepted; a `/reviews/<slug>` link is rewritten to
+   `/reviews/<slug>/complaints`.
+
+### Parsing — AskGamblers markup since the 2026 redesign (`parseComplaintsDom`)
+- **Counts** come from the "Filter by Status" sidebar, AskGamblers' own exact totals —
+  no pagination: `a.filters-links-dropdown__option` → `.filters-links-dropdown__label` +
+  `.filters-links-dropdown__count`, keyed by the link's `?status=`:
+  `solved`→Resolved, `rejected`→Rejected, `unsolved`→Unresolved, `open`→In Progress
+  (= sheet **Open**), no status param → **All** (= sheet **Total**). A status with 0
+  complaints is omitted from the sidebar → 0.
+- **Open timers**: open cards are `a.complaint-card` with
+  `.complaint-status__text` = `"55h"` (+ "left"); closed cards show an icon. The first
+  page holds 24 cards (rest via a JS "Load more"); if In Progress > open cards on page 1,
+  the `?status=open` page is loaded once for the remaining timers.
+- **Fresh data**: the page is fetched with a unique `_cb=` param — Cloudflare's edge
+  cache otherwise serves copies hours old. Same single request, no extra load.
+- **Fail loudly**: missing sidebar, an unknown status, or All ≠ sum of statuses →
+  `ok:false, error:"Parse failed: …"` (no proxy fallback), so the sheet shows ERROR
+  instead of wrong numbers. Log lines: `[parse] ✓ … All=25 R=23 …` / `[parse] ✗ …`.
+- The pre-2026 parser counted each card ~4× through nested `[class*='complaint-card']`
+  matches and required exact status text — every stored Total was a multiple of 4.
 5. **Single shared browser** — reused, restarted on health-check failure / scrape-count
    limit / memory pressure; resets + cools down after `CONSECUTIVE_FAIL_LIMIT`. No
    per-request isolation → concurrent `/api/scrape` calls are unsafe (see GAS lock).
@@ -85,7 +106,7 @@ and no `page.authenticate()`. Created at launch, closed on reset. **Never re-add
 ### Tunable constants (top of `server.js` — read file for current values)
 - `MAX_SCRAPES_PER_BROWSER` — restart browser after N scrapes.
 - `MEMORY_RESTART_MB` — periodic guard resets browser when RSS exceeds this (~380).
-- Pagination cap in `scrapeCasino` (`pg <= N`) — pages per casino; high = memory bomb.
+- Pages per casino: 1 (2 only when open cases sit beyond the first 24 cards).
 - `--js-flags=--max-old-space-size=N` — V8 heap ceiling.
 - `SCRAPE_TIMEOUT`, `LAUNCH_TIMEOUT`, `CONSECUTIVE_FAIL_LIMIT`, `COOLDOWN_MS`.
 
@@ -148,7 +169,7 @@ These encode a past incident where the scraper crash-looped Render for a day:
 Render Events show **"Ran out of memory (used over 512MB)."** Chromium accumulates
 memory; a heavy/paginated casino can spike RSS past 512 MB between the 30s checks and
 Render kills the instance (crash-recover loop). Levers, cheapest first: lower
-`MAX_SCRAPES_PER_BROWSER` (e.g. 25→8), lower the pagination cap (e.g. 50→15), tighten
+`MAX_SCRAPES_PER_BROWSER` (e.g. 25→8), keep pages per casino at 1 (done in v6), tighten
 `--max-old-space-size` (e.g. 256→128), optionally add a per-request pre-scrape RSS
 check. If tuning isn't enough, the honest fix is a paid Render tier (512 MB → 2 GB) —
 flag it rather than over-tuning. A code change redeploys both services (fine).
@@ -187,8 +208,13 @@ Executions log + the Render Live tail together. Then hand-copy the change into S
 
 ## Current task / open issues
 <!-- Keep this updated as you work. -->
-- **AskGamblers scraper fixes.** Most recent known issue: `ag-scraper` (Sheet 1)
-  hitting **Render 512 MB OOM** on heavy daily runs. First approach: the memory levers
-  above; if OOM persists on a clean run, evaluate the paid Render tier.
+- **Done (v6):** parser rebuilt for the redesigned AskGamblers complaints page (see
+  "Parsing" above). Verify after each daily run: `[parse] ✗` lines in Render logs.
+- **Rotate `AG_SECRET`** — its old value was committed to this public repo. Change it in
+  Render (both services) and in the GAS in one go.
+- `ag-scraper` (Sheet 1) was OOM-killed 6× during the 2026-11-12 daily run. v6 loads
+  1 page per casino instead of up to 15; re-check Render events after the next run
+  before considering the paid tier.
+- Both services currently report `proxy_pool_size` 10 (CLAUDE.md expected 20 on Sheet 1).
 - Candidate follow-ups: confirm Sheet 2's `AskGamblers Scrape.gs` isn't stale; add the
   LockService guard to CG's `runHybridBatch()`.

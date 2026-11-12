@@ -300,7 +300,7 @@ async function resetBrowser(reason) {
 // OPEN PAGE
 // ══════════════════════════════════════════════════════════════════
 
-async function openPage(browser, url, useProxy, hooks) {
+async function openPage(browser, url, useProxy) {
   const page = await browser.newPage();
 
  try {
@@ -316,7 +316,6 @@ async function openPage(browser, url, useProxy, hooks) {
         req.continue();
       }
     });
-    if (hooks && hooks.beforeGoto) hooks.beforeGoto(page);  // TEMP debug hook
 
     await page.setViewport({ width: 1280, height: 800 });
     await page.setUserAgent(
@@ -328,24 +327,7 @@ async function openPage(browser, url, useProxy, hooks) {
     });
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
-
-    try {
-      await page.waitForFunction(
-        () => !document.title.includes("Just a moment") &&
-              !document.title.includes("Attention Required") &&
-              document.title.length > 0,
-        { timeout: TITLE_WAIT_TIMEOUT, polling: 500 }
-      );
-    } catch (e) {}
-
-    try {
-      await page.waitForFunction(
-        () => document.querySelector(
-          "article,[class*='complaint-item'],[class*='complaint-card'],a[href*='casino-complaints']"
-        ) !== null,
-        { timeout: 8000, polling: 500 }
-      );
-    } catch (e) {}
+    await waitForComplaints(page);
 
     return page;
   } catch (err) {
@@ -354,80 +336,116 @@ async function openPage(browser, url, useProxy, hooks) {
   }
 }
 
+// Wait until Cloudflare's interstitial is gone and the complaints markup is present.
+async function waitForComplaints(page) {
+  try {
+    await page.waitForFunction(
+      () => !document.title.includes("Just a moment") &&
+            !document.title.includes("Attention Required") &&
+            document.title.length > 0,
+      { timeout: TITLE_WAIT_TIMEOUT, polling: 500 }
+    );
+  } catch (e) {}
+
+  try {
+    await page.waitForFunction(
+      () => document.querySelector(".filters-links-dropdown__count, .complaint-card") !== null,
+      { timeout: 8000, polling: 500 }
+    );
+  } catch (e) {}
+}
+
 // ══════════════════════════════════════════════════════════════════
-// SCRAPE LIST
+// PARSE A COMPLAINTS PAGE (AskGamblers markup since the 2026 redesign)
+//
+// Counts come from the "Filter by Status" sidebar, which carries AskGamblers'
+// own exact totals for the casino — no pagination needed:
+//   <a class="filters-links-dropdown__option" href=".../complaints?status=solved">
+//     <span class="filters-links-dropdown__label">Resolved</span>
+//     <span class="filters-links-dropdown__count">23</span></a>
+// status=solved|rejected|unsolved|open; the "All" link has no status param.
+// A status with 0 complaints is simply left out (e.g. Unresolved), so it counts as 0.
+//
+// Open-case timers come from the cards: an open case's a.complaint-card holds
+// <span class="complaint-status__text">55h</span> <span>left</span>; closed cases
+// show a status icon instead.
+//
+// Runs inside the page via page.evaluate(), so it must stay self-contained.
 // ══════════════════════════════════════════════════════════════════
 
-async function scrapeList(page) {
-  return page.evaluate(() => {
-    const r = {
-      resolved:0, rejected:0, unresolved:0, open:0,
-      openEntries:[], totalPages:1
-    };
+function parseComplaintsDom() {
+  const KEY_BY_STATUS = { solved: "resolved", rejected: "rejected", unsolved: "unresolved", open: "open" };
+  const KEY_BY_LABEL  = { "all": "all", "resolved": "resolved", "rejected": "rejected",
+                          "unresolved": "unresolved", "in progress": "open" };
+  const CLOSED_TEXT   = ["resolved", "rejected", "unresolved"];
+  const clean = s => (s || "").replace(/\s+/g, " ").trim();
 
-    const selectors = [
-      "article","[class*='complaint-item']","[class*='complaint_item']",
-      "[class*='complaint-card']","[class*='complaintCard']",
-    ];
-    let cards = [];
-    for (const sel of selectors) {
-      const found = Array.from(document.querySelectorAll(sel));
-      if (found.length > 0) { cards = found; break; }
+  const counts = {}, problems = [];
+  document.querySelectorAll(".filters-links-dropdown__option").forEach(a => {
+    const labelEl = a.querySelector(".filters-links-dropdown__label");
+    const countEl = a.querySelector(".filters-links-dropdown__count");
+    const label = clean(labelEl && labelEl.textContent);
+    const countText = clean(countEl && countEl.textContent);
+    let status = null;
+    try { status = new URL(a.href).searchParams.get("status"); } catch (e) {}
+    const key = status ? KEY_BY_STATUS[status] : KEY_BY_LABEL[label.toLowerCase()];
+    const n = /^\d[\d,]*$/.test(countText) ? parseInt(countText.replace(/,/g, ""), 10) : NaN;
+    if (!key || isNaN(n)) {
+      problems.push(`unrecognised status filter "${label}" (status=${status}) count="${countText}"`);
+      return;
     }
-    if (cards.length === 0) {
-      document.querySelectorAll("a[href*='casino-complaints']").forEach(a => {
-        const card = a.closest("article,li,div[class],[class*='card']");
-        if (card && !cards.includes(card)) cards.push(card);
-      });
-    }
-
-    cards.forEach(card => {
-      const statusEl = card.querySelector(
-        "[class*='status'],[class*='badge'],[class*='label'],[class*='state']"
-      );
-      let status = "";
-      if (statusEl) {
-        status = statusEl.textContent.trim().toUpperCase();
-      } else {
-        const leaves = Array.from(card.querySelectorAll("*"))
-          .filter(el => el.children.length === 0);
-        for (const leaf of leaves) {
-          const t = leaf.textContent.trim().toUpperCase();
-          if (["RESOLVED","REJECTED","UNRESOLVED","OPEN"].includes(t)) {
-            status = t; break;
-          }
-        }
-      }
-      if (status === "RESOLVED")   r.resolved++;
-      if (status === "REJECTED")   r.rejected++;
-      if (status === "UNRESOLVED") r.unresolved++;
-      if (status === "OPEN")       r.open++;
-
-      const link = card.querySelector("a[href*='casino-complaints']");
-      if (!link) return;
-      const url     = link.href;
-      const cardLow = (card.textContent||"").replace(/\s+/g," ").toLowerCase();
-      const m = cardLow.match(/(\d+)\s*hours?\s*left/i);
-      if (m) {
-        const hoursLeft = parseInt(m[1]);
-        const d = Math.floor(hoursLeft/24), h = hoursLeft%24;
-        if (!r.openEntries.find(e => e.url === url)) {
-          r.openEntries.push({
-            hoursLeft,
-            timer: d > 0 ? (d+"d "+h+"h") : (h+"h"),
-            url
-          });
-        }
-      }
-    });
-
-    document.querySelectorAll("a[href*='page=']").forEach(a => {
-      const m = (a.href||"").match(/page=(\d+)/);
-      if (m && parseInt(m[1]) > r.totalPages) r.totalPages = parseInt(m[1]);
-    });
-
-    return r;
+    if (key in counts && counts[key] !== n) problems.push(`conflicting ${key} counts ${counts[key]} vs ${n}`);
+    counts[key] = n;
   });
+
+  const cards = document.querySelectorAll(".complaint-card");
+  const openEntries = [];
+  let openCards = 0;
+  cards.forEach(card => {
+    const textEl = card.querySelector(".complaint-status__text");
+    const text = clean(textEl && textEl.textContent);
+    if (!text || CLOSED_TEXT.includes(text.toLowerCase())) return;
+    openCards++;
+    const link = card.matches("a[href]") ? card : (card.querySelector("a[href]") || card.closest("a[href]"));
+    const m = text.match(/^(\d+)\s*([dhm])/i);              // "55h", also tolerates "3d" / "40m"
+    if (!link || !m) return;
+    const n = parseInt(m[1], 10), unit = m[2].toLowerCase();
+    const hoursLeft = unit === "d" ? n * 24 : unit === "h" ? n : 0;
+    const d = Math.floor(hoursLeft / 24), h = hoursLeft % 24;
+    if (!openEntries.some(e => e.url === link.href)) {
+      openEntries.push({ hoursLeft, timer: d > 0 ? (d + "d " + h + "h") : (h + "h"), url: link.href });
+    }
+  });
+
+  return { counts, problems, openEntries, openCards, cardCount: cards.length };
+}
+
+// Returns null when the parsed counts are trustworthy, otherwise a reason. Callers
+// return ok:false on a reason, so the sheet shows ERROR instead of wrong numbers.
+function countsProblem(p) {
+  if (p.problems.length) return p.problems.join("; ");
+  if (!("all" in p.counts)) return `status filters not found (${p.cardCount} complaint cards on page)`;
+  const sum = ["resolved", "rejected", "unresolved", "open"].reduce((s, k) => s + (p.counts[k] || 0), 0);
+  if (sum !== p.counts.all) return `status counts don't add up: All=${p.counts.all}, sum of statuses=${sum}`;
+  return null;
+}
+
+// Cloudflare serves the complaints page from an edge cache that can be hours old.
+// A unique query parameter makes it return the current page — same single request.
+function freshUrl(url, extraParams) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(extraParams || {})) u.searchParams.set(k, v);
+  u.searchParams.set("_cb", Date.now().toString(36));
+  return u.toString();
+}
+
+// A sheet row may link the casino's review page instead of its complaints page.
+function complaintsUrl(url) {
+  const u = new URL(url);
+  if (/^\/online-casinos\/reviews\/[^/]+\/?$/.test(u.pathname)) {
+    u.pathname = u.pathname.replace(/\/?$/, "/complaints");
+  }
+  return u.toString();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -452,49 +470,54 @@ async function scrapeCasino(url, mode, proxyHost) {
   try {
     const browser  = await getBrowser(mode, proxyHost);
     const useProxy = mode === "proxy";
-    page = await openPage(browser, url, useProxy);
+    page = await openPage(browser, freshUrl(url), useProxy);
     const title   = await page.title();
     const modeStr = mode === "proxy" ? `[proxy:${proxyHost}]` : `[direct]`;
-    console.log(`${modeStr} ${url.split("/").slice(-2).join("/")} → ${title}`);
+    const short   = url.split("/").slice(-2).join("/");
+    console.log(`${modeStr} ${short} → ${title}`);
 
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return { ok: false, error: "Cloudflare block", cfBlocked: true };
     }
 
-    const data       = await scrapeList(page);
-    const allEntries = [...data.openEntries];
+    const parsed = await page.evaluate(parseComplaintsDom);
+    state.scrapeCount++;
 
-    for (let pg = 2; pg <= data.totalPages && pg <= 15; pg++) {
-      const sep   = url.includes("?") ? "&" : "?";
-      const pgUrl = url + sep + "page=" + pg;
-      await page.goto(pgUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
-      try {
-        await page.waitForFunction(
-          () => !document.title.includes("Just a moment") && document.title.length > 0,
-          { timeout: 10000, polling: 500 }
-        );
-      } catch (e) {}
-      const pgData = await scrapeList(page);
-      data.resolved   += pgData.resolved;
-      data.rejected   += pgData.rejected;
-      data.unresolved += pgData.unresolved;
-      data.open       += pgData.open;
-      pgData.openEntries.forEach(e => {
-        if (!allEntries.find(x => x.url === e.url)) allEntries.push(e);
-      });
+    const problem = countsProblem(parsed);
+    if (problem) {
+      console.log(`[parse] ✗ ${short} → ${problem}`);
+      return { ok: false, error: "Parse failed: " + problem, cfBlocked: false };
     }
 
-    state.scrapeCount++;
+    const c = parsed.counts;
+    const openEntries = parsed.openEntries;
+
+    // Open cases are normally the newest, so they sit among the first 24 cards. Only if
+    // some are further down, load the "In Progress" filter page once for their timers.
+    let extraPage = false;
+    if ((c.open || 0) > parsed.openCards) {
+      extraPage = true;
+      try {
+        await page.goto(freshUrl(url, { status: "open" }), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+        await waitForComplaints(page);
+        const more = await page.evaluate(parseComplaintsDom);
+        more.openEntries.forEach(e => { if (!openEntries.some(x => x.url === e.url)) openEntries.push(e); });
+      } catch (e) {
+        console.log(`[parse] ${short} → In Progress page failed (${e.message}); keeping ${openEntries.length} timers`);
+      }
+    }
+
+    console.log(`[parse] ✓ ${short} → All=${c.all} R=${c.resolved || 0} Rj=${c.rejected || 0} U=${c.unresolved || 0} Open=${c.open || 0} timers=${openEntries.length}${extraPage ? " (+In Progress page)" : ""}`);
 
     return {
       ok:          true,
       title,
-      resolved:    data.resolved,
-      rejected:    data.rejected,
-      unresolved:  data.unresolved,
-      open:        data.open,
-      total:       data.resolved + data.rejected + data.unresolved + data.open,
-      openEntries: allEntries,
+      resolved:    c.resolved   || 0,
+      rejected:    c.rejected   || 0,
+      unresolved:  c.unresolved || 0,
+      open:        c.open       || 0,
+      total:       c.all,
+      openEntries,
     };
 
   } catch (e) {
@@ -521,58 +544,6 @@ async function scrapeCasino(url, mode, proxyHost) {
         page.removeAllListeners && page.removeAllListeners();
         await page.close();
       } catch (e) {}
-    }
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════
-// TEMPORARY DEBUG CAPTURE — remove once the new-markup parser ships.
-// Same browser / proxy path as scrapeCasino, but returns the rendered DOM,
-// embedded JSON and XHR/fetch responses instead of parsed counts.
-// ══════════════════════════════════════════════════════════════════
-
-async function debugCapture(url, mode, proxyHost) {
-  let page = null;
-  const net = [];
-  try {
-    const browser = await getBrowser(mode, proxyHost);
-    page = await openPage(browser, url, mode === "proxy", {
-      beforeGoto: p => p.on("response", async r => {
-        const t = r.request().resourceType();
-        if (!["xhr", "fetch", "document"].includes(t)) return;
-        const e = { url: r.url(), status: r.status(), type: t, ct: r.headers()["content-type"] || "" };
-        net.push(e);
-        try { e.body = (await r.text()).slice(0, 300000); } catch (err) { e.body = "ERR " + err.message; }
-      }),
-    });
-    await new Promise(r => setTimeout(r, 3000));  // let late client-side fetches land
-    const title = await page.title();
-    console.log(`[debug] ${mode}${proxyHost ? " " + proxyHost : ""} ${url} → ${title}`);
-    if (title.includes("Just a moment") || title.includes("Attention Required")) {
-      return { ok: false, error: "Cloudflare block", cfBlocked: true, title };
-    }
-    const html = await page.content();
-    const embedded = await page.evaluate(() => {
-      const out = {};
-      const nd = document.getElementById("__NEXT_DATA__");
-      if (nd) out.nextData = nd.textContent.slice(0, 500000);
-      out.jsonScripts = Array.from(document.querySelectorAll(
-        'script[type="application/json"],script[type="application/ld+json"]'
-      )).map(s => ({ id: s.id, type: s.type, len: s.textContent.length, text: s.textContent.slice(0, 100000) }));
-      out.globals = ["__NUXT__", "__NEXT_DATA__", "__INITIAL_STATE__", "__APOLLO_STATE__",
-                     "__PRELOADED_STATE__", "__remixContext", "__next_f"]
-        .filter(k => typeof window[k] !== "undefined");
-      return out;
-    });
-    state.scrapeCount++;
-    return { ok: true, debug: true, mode, proxyHost, title, finalUrl: page.url(),
-             htmlLength: html.length, html, embedded, net };
-  } catch (e) {
-    console.error(`[debug error] ${e.message}`);
-    return { ok: false, error: e.message, cfBlocked: isCloudflareError(e) };
-  } finally {
-    if (page) {
-      try { page.removeAllListeners && page.removeAllListeners(); await page.close(); } catch (e) {}
     }
   }
 }
@@ -616,23 +587,17 @@ app.get("/api/scrape", async (req, res) => {
     return res.status(503).json({ ok: false, error: "Proxy list not yet loaded" });
   }
 
-  const decodedUrl = decodeURIComponent(url);
+  // Only AskGamblers pages: the scraper must never be usable to fetch arbitrary
+  // sites through our browser and proxy pool.
+  let decodedUrl;
+  try {
+    decodedUrl = complaintsUrl(decodeURIComponent(url));
+    const host = new URL(decodedUrl).hostname;
+    if (host !== "askgamblers.com" && !host.endsWith(".askgamblers.com")) throw new Error("host");
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: "Only askgamblers.com complaint URLs are supported" });
+  }
   const startTime  = Date.now();
-
-  // TEMP debug mode: only when a secret is actually configured (never open).
-  const isDebug = req.query.debug === "html";
-  if (isDebug && !SECRET) {
-    return res.status(403).json({ ok: false, error: "debug requires AG_SECRET to be set" });
-  }
-  if (isDebug) {
-    let host = "";
-    try { const u = new URL(decodedUrl); host = u.protocol === "https:" ? u.hostname : ""; } catch (e) {}
-    if (host !== "www.askgamblers.com") {
-      return res.status(400).json({ ok: false, error: "debug only allows https://www.askgamblers.com URLs" });
-    }
-  }
-  const run = isDebug ? debugCapture : scrapeCasino;
-  const forceProxy = isDebug && req.query.force === "proxy";
 
 // Proactive memory guard — reset the browser before it can OOM the 512MB instance.
   const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -649,8 +614,8 @@ app.get("/api/scrape", async (req, res) => {
   }
 
   try {
-    let result = forceProxy ? { ok: false, cfBlocked: true } : await withTimeout(
-      run(decodedUrl, "direct", null),
+    let result = await withTimeout(
+      scrapeCasino(decodedUrl, "direct", null),
       SCRAPE_TIMEOUT,
       "Direct"
     );
@@ -659,7 +624,7 @@ app.get("/api/scrape", async (req, res) => {
       const proxy = getProxyForUrl(decodedUrl);
       console.log(`[fallback] Direct blocked/timeout → proxy ${proxy.host}`);
       result = await withTimeout(
-        run(decodedUrl, "proxy", proxy.host),
+        scrapeCasino(decodedUrl, "proxy", proxy.host),
         SCRAPE_TIMEOUT,
         "Proxy"
       );
@@ -692,7 +657,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v5-debug-tmp",
+    version: "v6-ag-2026-markup",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
