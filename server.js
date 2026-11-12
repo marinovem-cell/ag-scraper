@@ -300,7 +300,7 @@ async function resetBrowser(reason) {
 // OPEN PAGE
 // ══════════════════════════════════════════════════════════════════
 
-async function openPage(browser, url, useProxy) {
+async function openPage(browser, url, useProxy, hooks) {
   const page = await browser.newPage();
 
  try {
@@ -316,6 +316,7 @@ async function openPage(browser, url, useProxy) {
         req.continue();
       }
     });
+    if (hooks && hooks.beforeGoto) hooks.beforeGoto(page);  // TEMP debug hook
 
     await page.setViewport({ width: 1280, height: 800 });
     await page.setUserAgent(
@@ -525,6 +526,58 @@ async function scrapeCasino(url, mode, proxyHost) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// TEMPORARY DEBUG CAPTURE — remove once the new-markup parser ships.
+// Same browser / proxy path as scrapeCasino, but returns the rendered DOM,
+// embedded JSON and XHR/fetch responses instead of parsed counts.
+// ══════════════════════════════════════════════════════════════════
+
+async function debugCapture(url, mode, proxyHost) {
+  let page = null;
+  const net = [];
+  try {
+    const browser = await getBrowser(mode, proxyHost);
+    page = await openPage(browser, url, mode === "proxy", {
+      beforeGoto: p => p.on("response", async r => {
+        const t = r.request().resourceType();
+        if (!["xhr", "fetch", "document"].includes(t)) return;
+        const e = { url: r.url(), status: r.status(), type: t, ct: r.headers()["content-type"] || "" };
+        net.push(e);
+        try { e.body = (await r.text()).slice(0, 300000); } catch (err) { e.body = "ERR " + err.message; }
+      }),
+    });
+    await new Promise(r => setTimeout(r, 3000));  // let late client-side fetches land
+    const title = await page.title();
+    console.log(`[debug] ${mode}${proxyHost ? " " + proxyHost : ""} ${url} → ${title}`);
+    if (title.includes("Just a moment") || title.includes("Attention Required")) {
+      return { ok: false, error: "Cloudflare block", cfBlocked: true, title };
+    }
+    const html = await page.content();
+    const embedded = await page.evaluate(() => {
+      const out = {};
+      const nd = document.getElementById("__NEXT_DATA__");
+      if (nd) out.nextData = nd.textContent.slice(0, 500000);
+      out.jsonScripts = Array.from(document.querySelectorAll(
+        'script[type="application/json"],script[type="application/ld+json"]'
+      )).map(s => ({ id: s.id, type: s.type, len: s.textContent.length, text: s.textContent.slice(0, 100000) }));
+      out.globals = ["__NUXT__", "__NEXT_DATA__", "__INITIAL_STATE__", "__APOLLO_STATE__",
+                     "__PRELOADED_STATE__", "__remixContext", "__next_f"]
+        .filter(k => typeof window[k] !== "undefined");
+      return out;
+    });
+    state.scrapeCount++;
+    return { ok: true, debug: true, mode, proxyHost, title, finalUrl: page.url(),
+             htmlLength: html.length, html, embedded, net };
+  } catch (e) {
+    console.error(`[debug error] ${e.message}`);
+    return { ok: false, error: e.message, cfBlocked: isCloudflareError(e) };
+  } finally {
+    if (page) {
+      try { page.removeAllListeners && page.removeAllListeners(); await page.close(); } catch (e) {}
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
 // MEMORY MONITOR
 // ══════════════════════════════════════════════════════════════════
 
@@ -566,6 +619,21 @@ app.get("/api/scrape", async (req, res) => {
   const decodedUrl = decodeURIComponent(url);
   const startTime  = Date.now();
 
+  // TEMP debug mode: only when a secret is actually configured (never open).
+  const isDebug = req.query.debug === "html";
+  if (isDebug && !SECRET) {
+    return res.status(403).json({ ok: false, error: "debug requires AG_SECRET to be set" });
+  }
+  if (isDebug) {
+    let host = "";
+    try { const u = new URL(decodedUrl); host = u.protocol === "https:" ? u.hostname : ""; } catch (e) {}
+    if (host !== "www.askgamblers.com") {
+      return res.status(400).json({ ok: false, error: "debug only allows https://www.askgamblers.com URLs" });
+    }
+  }
+  const run = isDebug ? debugCapture : scrapeCasino;
+  const forceProxy = isDebug && req.query.force === "proxy";
+
 // Proactive memory guard — reset the browser before it can OOM the 512MB instance.
   const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
   if (rssMB > 380 && state.browser) {
@@ -581,8 +649,8 @@ app.get("/api/scrape", async (req, res) => {
   }
 
   try {
-    let result = await withTimeout(
-      scrapeCasino(decodedUrl, "direct", null),
+    let result = forceProxy ? { ok: false, cfBlocked: true } : await withTimeout(
+      run(decodedUrl, "direct", null),
       SCRAPE_TIMEOUT,
       "Direct"
     );
@@ -591,7 +659,7 @@ app.get("/api/scrape", async (req, res) => {
       const proxy = getProxyForUrl(decodedUrl);
       console.log(`[fallback] Direct blocked/timeout → proxy ${proxy.host}`);
       result = await withTimeout(
-        scrapeCasino(decodedUrl, "proxy", proxy.host),
+        run(decodedUrl, "proxy", proxy.host),
         SCRAPE_TIMEOUT,
         "Proxy"
       );
@@ -624,7 +692,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v5-webshare-api",
+    version: "v5-debug-tmp",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
