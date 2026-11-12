@@ -228,7 +228,25 @@ async function launchBrowserInternal(mode, proxyHost) {
     setTimeout(() => reject(new Error(`Browser launch timeout ${LAUNCH_TIMEOUT}ms`)), LAUNCH_TIMEOUT)
   );
 
-  return Promise.race([launchPromise, timeout]);
+  return Promise.race([launchPromise, timeout]).catch(err => {
+    // If the launch finishes after we gave up on it, close that browser instead of leaking it.
+    launchPromise.then(b => closeBrowser(b)).catch(() => {});
+    throw err;
+  });
+}
+
+// Close a browser for real. A browser that is dropped without close() keeps its
+// Chromium running (~100 MB each) until Render OOM-kills the instance. close() can
+// also hang (seen: 50 s), so give it 10 s and then SIGKILL the Chromium process.
+async function closeBrowser(browser) {
+  if (!browser) return;
+  const proc = typeof browser.process === "function" ? browser.process() : null;
+  try {
+    await Promise.race([browser.close(), new Promise(r => setTimeout(r, 10000))]);
+  } catch (e) {}
+  if (proc && proc.exitCode === null && proc.signalCode === null) {
+    try { proc.kill("SIGKILL"); } catch (e) {}
+  }
 }
 
 async function getBrowser(mode, proxyHost) {
@@ -249,24 +267,29 @@ async function getBrowser(mode, proxyHost) {
     } catch (e) {
       log(`[browser] Health check failed: ${e.message}`);
     }
-    state.browser = null;
   }
 
+  // Recycling (limit reached, failed health check, or mode switch): the old browser
+  // must actually be closed — previously it was only dropped, leaking its Chromium.
   if (state.browser) {
-    try { await state.browser.close(); } catch (e) {}
+    const old = state.browser;
     state.browser = null;
+    await closeBrowser(old);
   }
 
   state.launchLock = (async () => {
-    state.browser     = await launchBrowserInternal(mode, proxyHost);
+    const browser     = await launchBrowserInternal(mode, proxyHost);
+    state.browser     = browser;
     state.mode        = mode;
     state.proxyHost   = proxyHost;
     state.launchedAt  = Date.now();
     state.scrapeCount = 0;
 
-    state.browser.on("disconnected", () => {
+    browser.on("disconnected", () => {
       log(`[browser] Disconnected event`);
-      if (state.browser) {
+      // Only clear state if it still points at THIS browser — a late disconnect from
+      // an old browser must not orphan the new one.
+      if (state.browser === browser) {
         state.browser = null;
         state.mode = null;
       }
@@ -286,9 +309,9 @@ async function getBrowser(mode, proxyHost) {
 
 async function resetBrowser(reason) {
   if (reason) log(`[browser] Reset: ${reason}`);
-  if (state.browser) {
-    try { await state.browser.close(); } catch (e) {}
-  }
+  const old = state.browser;
+  state.browser = null;
+  await closeBrowser(old);
   await closeAnonProxy();
   state.browser     = null;
   state.mode        = null;
@@ -479,6 +502,11 @@ async function scrapeCasino(url, mode, proxyHost) {
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return { ok: false, error: "Cloudflare block", cfBlocked: true };
     }
+    if (/^Page not found/i.test(title)) {
+      state.scrapeCount++;
+      console.log(`[parse] ✗ ${short} → page not found on AskGamblers`);
+      return { ok: false, error: "Page not found on AskGamblers - check this casino's URL in the sheet", cfBlocked: false };
+    }
 
     const parsed = await page.evaluate(parseComplaintsDom);
     state.scrapeCount++;
@@ -657,7 +685,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v6-ag-2026-markup",
+    version: "v6.1-browser-leak-fix",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
