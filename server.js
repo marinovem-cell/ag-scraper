@@ -19,6 +19,7 @@ const MEMORY_CHECK_INTERVAL   = 30000;
 const PROTOCOL_TIMEOUT        = 60000;
 const LAUNCH_TIMEOUT          = 45000;
 const NAV_TIMEOUT             = 15000;
+const FRESH_NAV_TIMEOUT       = 20000;   // fresh (cache-busted) page; then fall back to the cached copy
 const TITLE_WAIT_TIMEOUT      = 15000;
 const SCRAPE_TIMEOUT          = 65000;
 const MAX_SCRAPES_PER_BROWSER = 8;
@@ -323,7 +324,7 @@ async function resetBrowser(reason) {
 // OPEN PAGE
 // ══════════════════════════════════════════════════════════════════
 
-async function openPage(browser, url, useProxy) {
+async function openPage(browser, url, useProxy, navTimeout = NAV_TIMEOUT) {
   const page = await browser.newPage();
 
  try {
@@ -349,7 +350,7 @@ async function openPage(browser, url, useProxy) {
       "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: navTimeout });
     await waitForComplaints(page);
 
     return page;
@@ -493,11 +494,22 @@ async function scrapeCasino(url, mode, proxyHost) {
   try {
     const browser  = await getBrowser(mode, proxyHost);
     const useProxy = mode === "proxy";
-    page = await openPage(browser, freshUrl(url), useProxy);
+    const short   = url.split("/").slice(-2).join("/");
+    // Fresh page first (Cloudflare's cache can be hours old). AskGamblers' origin is
+    // sometimes too slow to build a fresh page; then take the cached copy instead —
+    // still direct, no proxy. Only if that fails too does the proxy fallback kick in.
+    let cached = false;
+    try {
+      page = await openPage(browser, freshUrl(url), useProxy, FRESH_NAV_TIMEOUT);
+    } catch (e) {
+      if (!/timeout/i.test(e.message)) throw e;
+      console.log(`[fresh] ${short} → fresh page timed out after ${FRESH_NAV_TIMEOUT / 1000}s, using the cached copy`);
+      cached = true;
+      page = await openPage(browser, url, useProxy);
+    }
     const title   = await page.title();
     const modeStr = mode === "proxy" ? `[proxy:${proxyHost}]` : `[direct]`;
-    const short   = url.split("/").slice(-2).join("/");
-    console.log(`${modeStr} ${short} → ${title}`);
+    console.log(`${modeStr} ${short} → ${title}${cached ? " (cached copy)" : ""}`);
 
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return { ok: false, error: "Cloudflare block", cfBlocked: true };
@@ -535,7 +547,7 @@ async function scrapeCasino(url, mode, proxyHost) {
       }
     }
 
-    console.log(`[parse] ✓ ${short} → All=${c.all} R=${c.resolved || 0} Rj=${c.rejected || 0} U=${c.unresolved || 0} Open=${c.open || 0} timers=${openEntries.length}${extraPage ? " (+In Progress page)" : ""}`);
+    console.log(`[parse] ✓ ${short} → All=${c.all} R=${c.resolved || 0} Rj=${c.rejected || 0} U=${c.unresolved || 0} Open=${c.open || 0} timers=${openEntries.length}${extraPage ? " (+In Progress page)" : ""}${cached ? " [cached copy]" : ""}`);
 
     return {
       ok:          true,
@@ -685,7 +697,7 @@ app.get("/", (req, res) => {
   const usage = process.memoryUsage();
   res.json({
     status:  "AG Scraper running",
-    version: "v6.1-browser-leak-fix",
+    version: "v6.2-cached-fallback",
     memory:  {
       rss_mb:  Math.round(usage.rss / 1024 / 1024),
       heap_mb: Math.round(usage.heapUsed / 1024 / 1024),
