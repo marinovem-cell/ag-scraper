@@ -210,8 +210,9 @@ Executions log + the Render Live tail together. Then hand-copy the change into S
 <!-- Keep this updated as you work. -->
 - **Done (v6):** parser rebuilt for the redesigned AskGamblers complaints page (see
   "Parsing" above). Verify after each daily run: `[parse] ✗` lines in Render logs.
-- **Rotate `AG_SECRET`** — its old value was committed to this public repo. Change it in
-  Render (both services) and in the GAS in one go.
+- `AG_SECRET`'s value is in this public repo's git history. The owner decided (2026-11-12)
+  to keep it rather than rotate it — don't push for rotation. Mitigation in place:
+  `/api/scrape` accepts only askgamblers.com URLs. Making the repo private would help.
 - `ag-scraper` (Sheet 1) was OOM-killed 6× during the 2026-11-12 daily run. v6 loads
   1 page per casino instead of up to 15; re-check Render events after the next run
   before considering the paid tier.
