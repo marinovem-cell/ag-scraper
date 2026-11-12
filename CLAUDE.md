@@ -129,6 +129,9 @@ hand-copied into Sheet 2** (leave Sheet 2's `RENDER_URL` / `AG_DAILY_HOUR` lines
 ### Files (one namespace per project)
 - **`AskGamblers Scrape.gs`** — AG driver. 3 casinos/run, chains via ~30s trigger,
   calls Render, writes results, auto-retries ERROR rows. Most AG work is here.
+  Broken-URL note (2026-11-12): `agWriteError(sheet,row,error)` + `agSetUrlErrorNote_()`
+  put a note on the Total "ERROR" cell only when the server error matches
+  `/page not found/i` (AskGamblers 404 for the column-B link); `agWriteResult` clears it.
 - **`CasinoGuru Scrape.gs`** — CG scraper (n8n phase 1 + GAS fallback phase 2). Not
   part of AskGamblers issues.
 - **`Shared Helpers.gs`** — `todayStamp`, `nowTimestamp`, `isUpdatedToday`.

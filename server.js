@@ -514,6 +514,8 @@ async function scrapeCasino(url, mode, proxyHost) {
     if (title.includes("Just a moment") || title.includes("Attention Required")) {
       return { ok: false, error: "Cloudflare block", cfBlocked: true };
     }
+    // The GAS matches /page not found/i in this error to put a "broken URL" note on the
+    // row (agSetUrlErrorNote_) - keep that wording if you change the message.
     if (/^Page not found/i.test(title)) {
       state.scrapeCount++;
       console.log(`[parse] ✗ ${short} → page not found on AskGamblers`);
