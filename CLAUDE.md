@@ -166,6 +166,14 @@ These encode a past incident where the scraper crash-looped Render for a day:
 ## Known constraints & failure modes (hard-won)
 
 ### Render free tier = 512 MB RAM — the #1 recurring failure
+**Root cause found & fixed (v6.1, 2026-11-12):** `getBrowser()` recycled the browser
+after `MAX_SCRAPES_PER_BROWSER` by setting `state.browser = null` *before* the close,
+so every recycle leaked a whole Chromium (~100 MB). Render's memory metric showed a
+staircase, one step per recycle, ending in an OOM kill. The old process-RSS guard
+can't see Chromium (it measures Node only, ~60–90 MB). Now `closeBrowser()` closes
+(10 s cap) then SIGKILLs. Watch Render's memory metric: it should saw-tooth, not climb.
+If OOM still recurs, the levers below still apply.
+
 Render Events show **"Ran out of memory (used over 512MB)."** Chromium accumulates
 memory; a heavy/paginated casino can spike RSS past 512 MB between the 30s checks and
 Render kills the instance (crash-recover loop). Levers, cheapest first: lower
@@ -213,9 +221,11 @@ Executions log + the Render Live tail together. Then hand-copy the change into S
 - `AG_SECRET`'s value is in this public repo's git history. The owner decided (2026-11-12)
   to keep it rather than rotate it — don't push for rotation. Mitigation in place:
   `/api/scrape` accepts only askgamblers.com URLs. Making the repo private would help.
-- `ag-scraper` (Sheet 1) was OOM-killed 6× during the 2026-11-12 daily run. v6 loads
-  1 page per casino instead of up to 15; re-check Render events after the next run
-  before considering the paid tier.
+- `ag-scraper` (Sheet 1) was OOM-killed 6× in the 2026-11-12 daily run and 2× in the
+  v6 force refresh — caused by the browser-recycle leak, fixed in v6.1. Re-check Render
+  events + memory metric after the next daily run before considering the paid tier.
+- Sheet row `midasluck-casino` links a dead AskGamblers page ("Page not found"); the
+  brand may now be `midarion-casino` — owner to confirm and fix column B.
 - Both services currently report `proxy_pool_size` 10 (CLAUDE.md expected 20 on Sheet 1).
 - Candidate follow-ups: confirm Sheet 2's `AskGamblers Scrape.gs` isn't stale; add the
   LockService guard to CG's `runHybridBatch()`.
